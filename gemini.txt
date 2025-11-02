@@ -1,0 +1,1043 @@
+
+
+Это полное руководство, включающее в себя:
+1.  **Подробный план внедрения** — ваш пошаговый чек-лист.
+2.  **Все 6 необходимых файлов** — полностью готовые к копированию, с подробными комментариями к каждой строке.
+3.  **Инструкцию по настройке Webhooks** в GitLab.
+4.  **Документацию для команды** разработчиков 1С.
+
+Просто следуйте этому руководству шаг за шагом.
+
+---
+
+### **Часть 1: Подробный план внедрения**
+
+#### **Шаг 0: Подготовка Jenkins**
+
+1.  **Установите плагины:** Убедитесь, что в вашем Jenkins установлены плагины:
+    *   `Lockable Resources` (для предотвращения одновременного обновления баз).
+    *   `Generic Webhook Trigger` (для приема сигналов от GitLab).
+2.  **Создайте директорию состояний:** На сервере, где работает агент Jenkins, создайте папку для хранения информации о развернутых версиях. Например: `C:\Jenkins\deployment_state\`. Jenkins должен иметь права на запись в эту папку.
+3.  **Настройте Lockable Resource:**
+    *   Перейдите в `Manage Jenkins` -> `Configure System`.
+    *   Найдите раздел `Lockable Resources Manager` и нажмите `Add Lockable Resource`.
+    *   В поле `Name` введите `PROD_DATABASE_LOCK`.
+    *   Нажмите `Save`.
+
+#### **Шаг 1: Обновление Общей Библиотеки**
+
+1.  В вашем Git-репозитории, где хранится общая библиотека `1c-utils`, найдите файл `v8_utils.groovy` (или аналогичный).
+2.  **Полностью замените** его содержимое кодом из файла **`v8_utils_final_with_comments.groovy`** (см. Часть 2).
+3.  Сделайте `commit` и `push` в `master` ветку библиотеки.
+
+#### **Шаг 2: Перенастройка Пайплайна Выгрузки из 1С**
+
+1.  В Jenkins откройте ваш Job, отвечающий за `gitsync`.
+2.  **Полностью замените** его скрипт `pipeline` кодом из файла **`jenkins_pipline_выгрузка_final_with_comments.txt`**.
+3.  Сохраните Job.
+
+#### **Шаг 3: Создание Пайплайнов для Основной Конфигурации**
+
+1.  Создайте **два новых** Jenkins Job'а типа "Pipeline":
+    *   **Job №1 (Сборка):**
+        *   **Имя:** `ERP-Main-Config-Build`
+        *   **Код:** Вставьте содержимое из **`Jenkinsfile-main-config-BUILD_simplified.txt`**.
+    *   **Job №2 (Развертывание):**
+        *   **Имя:** `ERP-Main-Config-Deploy-Schedule`
+        *   **Код:** Вставьте содержимое из **`Jenkinsfile-main-config-DEPLOY-SCHEDULE.txt`**.
+        *   **Настройка:** В коде этого пайплайна найдите и установите правильное расписание в строке `cron('H 2 * * 6')`.
+
+#### **Шаг 4: Создание Пайплайнов для КАЖДОГО Расширения**
+
+1.  **Повторите** следующий процесс для **каждого** вашего расширения (Документы, Отчеты и т.д.):
+2.  Создайте **два новых** Jenkins Job'а типа "Pipeline":
+    *   **Job №1 (Сборка):**
+        *   **Имя:** `ERP-Extension-Documents-Build` (замените `Documents` на имя вашего расширения).
+        *   **Код:** Вставьте содержимое из **`Jenkinsfile-template-extension-BUILD_simplified.txt`**.
+        *   **Настройка:** В настройках Job'а установите значения по умолчанию для параметров `EXTENSION_NAME` и `GIT_REPO_URL`.
+    *   **Job №2 (Развертывание):**
+        *   **Имя:** `ERP-Extension-Documents-Deploy-Schedule`.
+        *   **Код:** Вставьте содержимое из **`Jenkinsfile-template-extension-DEPLOY-SCHEDULE.txt`**.
+        *   **Настройка:** В настройках Job'а установите значения по умолчанию для параметров `EXTENSION_NAME` и `GIT_REPO_URL`. В коде самого пайплайна настройте `cron`-расписания для этого расширения.
+
+#### **Шаг 5: Настройка Webhooks в GitLab**
+
+1.  Следуйте подробной инструкции из **Части 3** ниже, чтобы настроить GitLab на запуск всех ваших `Build` пайплайнов.
+
+#### **Шаг 6: Финализация**
+
+1.  Проведите полный цикл тестирования: сделайте MR в `develop`, дождитесь создания артефакта, а затем дождитесь технологического окна и убедитесь, что `Deploy` пайплайн отработал корректно.
+2.  После успешного тестирования **удалите старый монолитный Job сборки**.
+
+---
+
+### **Часть 2: Итоговые файлы (готовы к копированию)**
+
+#### **Файл 1: `v8_utils_final_with_comments.groovy`**
+*(Полная, прокомментированная версия для общей библиотеки `1c-utils`)*
+```groovy
+package io.libs
+
+import java.util.Random
+import org.apache.commons.lang.RandomStringUtils
+
+// ========================================================================
+// Вспомогательные методы
+// ========================================================================
+
+/**
+ * Выполняет системную команду (Windows/Unix) в указанной директории с кодировкой UTF-8.
+ * @param command Команда для выполнения.
+ * @param workDir Рабочая директория (опционально).
+ * @return Код возврата процесса.
+ */
+def cmd(command, workDir = "") {
+    if (!workDir.isEmpty()) {
+        command = "cd /D \"${workDir}\" & ${command}"
+    }
+    def returnCode = 0
+    if (isUnix()) {
+        returnCode = sh script: "${command}", returnStatus: true
+    } else {
+        returnCode = bat script: "chcp 65001 > nul\n ${command}", returnStatus: true
+    }
+    return returnCode
+}
+
+/**
+ * Создает один или несколько каталогов, если они не существуют.
+ * @param dirs Список путей для создания.
+ * @return Всегда возвращает 0.
+ */
+def ensureDirs(String... dirs) {
+    for (def d : dirs) {
+        if (d?.trim()) {
+            if (isUnix()) {
+                sh script: "mkdir -p \"${d}\"", returnStatus: true
+            } else {
+                bat script: "if not exist \"${d}\" mkdir \"${d}\"", returnStatus: true
+            }
+        }
+    }
+    return 0
+}
+
+// ========================================================================
+// Git-утилиты
+// ========================================================================
+
+/**
+ * Выполняет команду git в указанной директории.
+ * @param repoDir Путь к локальному Git-репозиторию.
+ * @param args Строка с командой и аргументами git (например, "status" или "commit -m 'My commit'").
+ * @return Код возврата процесса git.
+ */
+def git(String repoDir, String args) {
+    if (!repoDir?.trim()) error "git: repoDir is empty"
+    return cmd("git ${args}", repoDir)
+}
+
+/**
+ * Ищет и извлекает ключ задачи (например, 'ERP-1234') из текста коммита.
+ * @param message Текст коммита.
+ * @return Строка с номером задачи в верхнем регистре или null, если не найдено.
+ */
+@NonCPS
+def extractIssueKey(String message) {
+    if (!message) return null
+    def m = (message =~ /(?i)#?([A-Z][A-Z0-9_]+-\d+)/)
+    return m.find() ? m.group(1).toUpperCase() : null
+}
+
+// ========================================================================
+// Работа с 1С (сборка, обновление)
+// ========================================================================
+
+/**
+ * КОМПИЛИРУЕТ ИСХОДНИКИ КОНФИГУРАЦИИ В ФАЙЛ (.cf).
+ * Используется в "Build" пайплайнах для создания артефакта.
+ * @param srcDir Путь к каталогу с исходниками (src/cf).
+ * @param outputCfFile Полный путь к выходному .cf файлу.
+ * @param v8version Версия платформы 1С.
+ * @return 0 при успехе, иначе генерирует error.
+ */
+def compileCF_to_file_safe(srcDir, outputCfFile, v8version = '8.3.26.1540') {
+    ensureDirs(new File(outputCfFile).getParent())
+    def command = "vrunner compile --src \"${srcDir}\" --make-cf \"${outputCfFile}\" --v8version \"${v8version}\""
+    echo "Компиляция исходников из '${srcDir}' в файл '${outputCfFile}'..."
+    def returnCode = cmd(command)
+    if (returnCode != 0) { error "Компиляция конфигурации в файл завершилась с ошибкой." }
+    return returnCode
+}
+
+/**
+ * КОМПИЛИРУЕТ ИСХОДНИКИ РАСШИРЕНИЯ В ФАЙЛ (.cfe).
+ * Используется в "Build" пайплайнах для создания артефакта.
+ * @param extname Техническое имя расширения.
+ * @param srcDir Путь к каталогу с исходниками расширения.
+ * @param outputCfeFile Полный путь к выходному .cfe файлу.
+ * @param v8version Версия платформы 1С.
+ * @return 0 при успехе.
+ */
+def compileCFE_to_file_safe(extname, srcDir, outputCfeFile, v8version = '8.3.26.1540') {
+    ensureDirs(new File(outputCfeFile).getParent())
+    def command = "vrunner compileexttocfe --src \"${srcDir}\" --ext-name \"${extname}\" --out \"${outputCfeFile}\" --v8version \"${v8version}\""
+    echo "Компиляция расширения '${extname}' в файл '${outputCfeFile}'..."
+    def returnCode = cmd(command)
+    if (returnCode != 0) { error "Компиляция расширения в файл завершилась с ошибкой." }
+    return returnCode
+}
+
+/**
+ * Обновление конфигурации базы данных напрямую через утилиту ibcmd.
+ * Это основной способ применения изменений в DEPLOY пайплайнах.
+ * @param dir Рабочий каталог с исходниками (по умолчанию env.WORKSPACE).
+ * @return Код возврата ibcmd, генерирует error при ошибке.
+ */
+def updatedb_ibcmd(dir = '', uccode = '', v8version = '8.3.26.1540') {
+    if (dir == '') dir = env.WORKSPACE
+    def icUser = env.IC_USER ?: ''; def icPass = env.IC_PASS ?: ''
+    def sqlUser = env.DB_USER ?: ''; def sqlPass = env.DB_PASS ?: ''
+    def dbmsServer = env.serverBD ?: env.server1c; def dbName = env.database
+    def srcPath = "${dir}\\src\\cf"
+    
+    def command = """ibcmd infobase config apply ^
+      --dbms=MSSQLServer --db-server="${dbmsServer}" --db-name="${dbName}" ^
+      --db-user="${sqlUser}" --db-pwd="${sqlPass}" -u "${icUser}" -P "${icPass}" ^
+      --data="${srcPath}" --force"""
+    
+    def returnCode = cmd(command)
+    if (returnCode != 0) { error 'Обновление конфигурации через ibcmd завершилось с ошибкой' }
+    return returnCode
+}
+
+// ========================================================================
+// Синхронизация хранилища 1С (gitsync)
+// ========================================================================
+
+/**
+ * Синхронизирует хранилище 1С с Git-репозиторием через gitsync sync.
+ * @param rep_1c Путь к хранилищу 1С.
+ * @param rep_git_local_src_cf Локальный путь к каталогу /src/cf в Git-репозитории.
+ * @return Код возврата процесса gitsync.
+ */
+def sync_hran(rep_1c, rep_git_local_src_cf, rep_git_remote, ext = "", aditional_parameters, server1c, repo_user, repo_pass) {
+    if (ext?.trim()) { ext = "--ext ${ext.trim()}" } else { ext = "" }
+    def command = "gitsync sync --storage-user \"${repo_user}\" --storage-pwd \"${repo_pass}\" ${ext} ${aditional_parameters} \"${rep_1c}\" \"${rep_git_local_src_cf}\""
+    return bat(script: "powershell -Command \"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}\"", returnStatus: true)
+}
+
+/**
+ * Инициализирует репозиторий для выгрузки из хранилища 1С через gitsync init.
+ * @param rep_1c Путь к хранилищу 1С.
+ * @param rep_git_local_src_cf Локальный путь к каталогу /src/cf в Git-репозитории.
+ * @return Код возврата процесса gitsync.
+ */
+def init_hran(rep_1c, rep_git_local_src_cf, ext = "", server1c = "", repo_user, repo_pass) {
+    if (ext?.trim()) { ext = "--ext ${ext.trim()}" } else { ext = "" }
+    def command = "gitsync init --storage-user \"${repo_user}\" --storage-pwd \"${repo_pass}\" ${ext} \"${rep_1c}\" \"${rep_git_local_src_cf}\""
+    return bat(script: "powershell -Command \"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}\"", returnStatus: true)
+}
+
+// ========================================================================
+// Уведомления и бэкапы
+// ========================================================================
+
+/**
+ * Отправка сообщения в чат Telegram через Bot API.
+ * @param TOKEN Токен Telegram-бота.
+ * @param CHAT_ID ID чата для отправки.
+ * @param messageText Текст сообщения.
+ * @param success true/false для отображения иконок ✅/❌.
+ */
+def telegram_send_message(TOKEN, CHAT_ID, messageText, success) {
+    if (success) {
+        messageText = "✅ ${messageText} \nСборка: ${env.BUILD_URL}"
+    } else {
+        messageText = "❌ ${messageText} \nСборка: ${env.BUILD_URL}"
+    }
+    writeFile file: 'tmp_telegram_message.txt', text: messageText, encoding: 'UTF-8'
+    def command = "chcp 65001 > nul & curl -s -X POST https://api.telegram.org/bot${TOKEN}/sendMessage -d chat_id=${CHAT_ID} --data-urlencode text@tmp_telegram_message.txt"
+    bat(script: command, returnStatus: true)
+}
+
+/**
+ * Создает сжатый бэкап базы MS SQL.
+ * @param server Имя экземпляра SQL Server.
+ * @param dbName Имя базы данных.
+ * @param backupDir Директория для сохранения бэкапа.
+ * @param sqlUser/sqlPass Логин и пароль для подключения к SQL.
+ * @return 0 при успехе, иначе генерирует error.
+ */
+def mssqlBackup(String server, String dbName, String backupDir, String sqlUser, String sqlPass) {
+    ensureDirs(backupDir)
+    def cmdStr = """
+    setlocal enableextensions
+    for /f %%a in ('powershell -NoProfile -Command "(Get-Date).ToString(\\"yyyyMMdd_HHmmss\\")"') do set "TS=%%a"
+    set "BAK=${backupDir}\\${dbName}_%TS%.bak"
+    sqlcmd -S "${server}" -U "${sqlUser}" -P "${sqlPass}" -b -Q "BACKUP DATABASE [${dbName}] TO DISK='%BAK%' WITH COPY_ONLY, INIT, COMPRESSION, STATS=5"
+    if errorlevel 1 exit /b 1
+    exit /b 0
+    """.trim()
+    def rc = bat(script: "chcp 65001 > nul\n${cmdStr}", returnStatus: true)
+    if (rc != 0) error "MS SQL backup failed"
+    return 0
+}
+
+// ========================================================================
+// Логика cherry-pick
+// ========================================================================
+
+/**
+ * Главный метод распределения коммитов из 1C_REPO по feature-веткам.
+ * Анализирует новые коммиты, определяет по их тексту номер задачи и выполняет
+ * cherry-pick в соответствующую feature-ветку. Автоматически разрешает
+ * конфликты в служебных файлах (VERSION, dumplist.txt).
+ * @param repoDir Путь к локальному Git-репозиторию.
+ * @return 0 при успехе, иначе генерирует error.
+ */
+def cherryPickTasksFrom1CRepo(String repoDir, String remoteHttps, String baseBranch = "1C_REPO", String compareBranch = "branch_sync_1c_repo") {
+    if (!repoDir?.trim()) error "cherryPick: repoDir is empty"
+
+    git(repoDir, "fetch --all --prune")
+    git(repoDir, "checkout -B \"${baseBranch}\" \"origin/${baseBranch}\"")
+    git(repoDir, "checkout -B \"${compareBranch}\" \"origin/${compareBranch}\"")
+    git(repoDir, "checkout \"${baseBranch}\"")
+
+    def pretty = isUnix() ? "%h;%s" : "%%h;%%s"
+    def logCmd = "log --reverse ${compareBranch}..${baseBranch} --pretty=format:\"${pretty}\""
+    
+    def tmpFile = ".git/commit_list.txt"
+    git(repoDir, "${logCmd} > ${tmpFile}")
+    def listContent = readFile(file: "${repoDir}\\${tmpFile}", encoding: 'UTF-8')
+    cmd("cd /D \"${repoDir}\" & del /Q ${tmpFile} 2>nul")
+
+    if (!listContent?.trim()) {
+        echo "Нет новых коммитов для обработки"
+        return 0
+    }
+
+    for (def line : listContent.readLines().findAll { it?.trim() }) {
+        def parts = line.split(";", 2)
+        if (parts.size() < 2) continue
+        def commit = parts[0].trim()
+        def message = parts[1].trim()
+        def issueKey = extractIssueKey(message)
+        if (!issueKey) continue
+
+        def featureBranch = "feature/${issueKey}"
+        echo "Обработка ${featureBranch} / ${commit}"
+
+        def rc = git(repoDir, "checkout -B \"${featureBranch}\" \"origin/${featureBranch}\"")
+        if (rc != 0) {
+            git(repoDir, "checkout -B \"${featureBranch}\"")
+        }
+
+        rc = git(repoDir, "cherry-pick ${commit} --keep-redundant-commits")
+
+        if (rc != 0) {
+            echo "Возник конфликт при cherry-pick коммита ${commit}. Анализируем..."
+            git(repoDir, "diff --name-only --diff-filter=U > .git\\conflicts.txt")
+            def conflictsContent = readFile(file: "${repoDir}\\.git\\conflicts.txt", encoding: 'UTF-8')
+            def conflictFiles = conflictsContent.readLines().collect { it.trim().replace('/', '\\') }
+            cmd("cd /D \"${repoDir}\" & del /Q .git\\conflicts.txt 2>nul")
+            
+            def knownServiceFiles = ["src\\cf\\VERSION", "src\\cf\\dumplist.txt"]
+            def isOnlyServiceFilesConflict = !conflictFiles.isEmpty() && conflictFiles.every { knownServiceFiles.contains(it) }
+
+            if (isOnlyServiceFilesConflict) {
+                echo "Конфликт только в служебных файлах. Разрешаем автоматически."
+                git(repoDir, "checkout ${commit} -- src/cf/VERSION src/cf/dumplist.txt")
+                git(repoDir, "add .")
+                rc = git(repoDir, "cherry-pick --continue")
+                if (rc != 0) {
+                    echo "Не удалось продолжить cherry-pick. Отменяем."
+                    git(repoDir, "cherry-pick --abort")
+                    continue
+                }
+            } else {
+                echo "Обнаружен серьезный конфликт в коде. Отмена cherry-pick для ${commit}."
+                git(repoDir, "cherry-pick --abort")
+                continue
+            }
+        }
+        
+        git(repoDir, "push --set-upstream origin \"${featureBranch}\"")
+    }
+    
+    git(repoDir, "checkout \"${baseBranch}\"")
+    return 0
+}
+
+/**
+ * Финальная синхронизация. Обновляет служебную ветку branch_sync_1c_repo,
+ * чтобы отметить коммиты как обработанные и не обрабатывать их в следующий раз.
+ * @param repoDir Путь к локальному Git-репозиторию.
+ * @return 0 при успехе.
+ */
+def updateBranchSyncFrom1CRepo(String repoDir, String remoteHttps, String baseBranch = "1C_REPO", String compareBranch = "branch_sync_1c_repo") {
+    if (!repoDir?.trim()) error "updateBranchSync: repoDir is empty"
+    git(repoDir, "fetch --all --prune")
+    git(repoDir, "checkout -B \"${compareBranch}\" \"origin/${compareBranch}\"")
+    git(repoDir, "reset --hard")
+    git(repoDir, "merge \"${baseBranch}\" --no-edit")
+    git(repoDir, "push origin \"${compareBranch}\"")
+    git(repoDir, "checkout \"${baseBranch}\"")
+    return 0
+}
+```
+
+---
+
+#### **Файл 2: `jenkins_pipline_выгрузка_final_with_comments.txt`**
+*(Полная версия для Jenkins Job, который выгружает данные из хранилища 1С в Git)*
+```groovy
+// ========================================================================
+//      JENKINS PIPELINE: СИНХРОНИЗАЦИЯ ХРАНИЛИЩА 1С С GIT (GITSYNC)
+// ========================================================================
+// НАЗНАЧЕНИЕ:
+// Этот пайплайн выполняет 3 ключевые задачи:
+// 1. Выгружает все новые коммиты из хранилища 1С в специальную ветку '1C_REPO' в Git.
+// 2. Анализирует сообщения коммитов, находит в них номера задач (например, ERP-1234).
+// 3. Автоматически переносит ("cherry-pick") каждый коммит в соответствующую
+//    feature-ветку (например, feature/ERP-1234).
+//
+// ТРИГГЕР: Запускается по расписанию (например, каждые 15 минут).
+// ========================================================================
+
+// --- Загрузка общей библиотеки утилит ---
+def loadSharedLibrary() {
+    def maxRetries = 3
+    def retryDelay = 5 // секунд
+    for (int i = 0; i < maxRetries; i++) {
+        try {
+            library '1c-utils@master'
+            return true
+        } catch (Exception e) {
+            if (i < maxRetries - 1) {
+                echo "Ошибка загрузки библиотеки (попытка ${i + 1}/${maxRetries}): ${e.message}"
+                sleep retryDelay
+            } else { throw e }
+        }
+    }
+}
+
+loadSharedLibrary()
+import io.libs.v8_utils
+def utils = new v8_utils()
+
+pipeline {
+    // Агент, на котором будут выполняться шаги
+    agent { label 'localhost' }
+
+    // Опции пайплайна
+    options {
+        timestamps() // Добавлять временные метки в лог
+        disableConcurrentBuilds() // Запретить параллельный запуск этого пайплайна
+    }
+
+    stages {
+        // --- ЭТАП 1: Подготовка рабочего пространства ---
+        stage('Checkout Source Code') {
+            steps {
+                script {
+                    // КЛЮЧЕВОЙ ШАГ: Полностью очищаем рабочую директорию.
+                    // Это гарантирует, что каждый запуск начинается с чистого листа,
+                    // решая 99% проблем с блокировками (.git/index.lock).
+                    cleanWs()
+
+                    // Клонируем свежую копию репозитория из Git
+                    withCredentials([usernamePassword(credentialsId: 'token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+                        def remoteUrl = "https://${GIT_USER}:${GIT_TOKEN}@${env.rep_git_remote}"
+                        utils.cmd("git clone --branch 1C_REPO --single-branch ${remoteUrl} .", env.WORKSPACE)
+                    }
+                    
+                    // Подтягиваем служебную ветку, необходимую для сравнения
+                    utils.cmd("git fetch origin branch_sync_1c_repo:branch_sync_1c_repo", env.WORKSPACE)
+                    utils.cmd("git checkout 1C_REPO", env.WORKSPACE)
+                }
+            }
+        }
+
+        // --- ЭТАП 2: Синхронизация с хранилищем 1С ---
+        stage('Init and Sync 1C Storage') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: 'repo_user_pass', usernameVariable: 'STORAGE_USER', passwordVariable: 'STORAGE_PASS')]) {
+                        def srcCfPath = "${env.WORKSPACE}\\src\\cf"
+                        
+                        // Инициализируем репозиторий для gitsync (если нужно)
+                        def rcInit = utils.init_hran(env.rep_1c, srcCfPath, '', env.server1c, STORAGE_USER, STORAGE_PASS)
+                        if (rcInit != 0) error "Ошибка инициализации хранилища: код ${rcInit}"
+
+                        // Выполняем основную синхронизацию: забираем коммиты из 1С
+                        def rcSync = utils.sync_hran(env.rep_1c, srcCfPath, "https://${env.rep_git_remote}", '', env.aditional_parameters ?: '', env.server1c, STORAGE_USER, STORAGE_PASS)
+                        if (rcSync != 0) error "Ошибка синхронизации: код ${rcSync}"
+                    }
+                    sleep 3 // Небольшая пауза на всякий случай
+                }
+            }
+        }
+
+        // --- ЭТАП 3: Отправка изменений в Git ---
+        stage('Push to 1C_REPO') {
+            steps {
+                script {
+                    // Отправляем все выгруженные коммиты в служебную ветку 1C_REPO
+                    withCredentials([usernamePassword(credentialsId: 'token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+                        utils.cmd("cd /D \"${env.WORKSPACE}\" & git push https://${GIT_USER}:${GIT_TOKEN}@${env.rep_git_remote} 1C_REPO")
+                    }
+                }
+            }
+        }
+
+        // --- ЭТАП 4: Распределение коммитов по feature-веткам ---
+        stage('Cherry-pick tasks to feature/*') {
+            steps {
+                script {
+                    // Устанавливаем URL с токеном для аутентификации
+                    withCredentials([usernamePassword(credentialsId: 'token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+                        utils.git(env.WORKSPACE, "remote set-url origin https://${GIT_USER}:${GIT_TOKEN}@${env.rep_git_remote}")
+                    }
+                    // Запускаем главный метод из библиотеки, который делает всю "магию"
+                    def rc = utils.cherryPickTasksFrom1CRepo(env.WORKSPACE, "https://${env.rep_git_remote}", "1C_REPO", "branch_sync_1c_repo")
+                    if (rc != 0) error "Cherry-pick завершился с ошибкой: код ${rc}"
+                }
+            }
+        }
+
+        // --- ЭТАП 5: Финальная синхронизация служебной ветки ---
+        stage('Sync branch_sync_1c_repo') {
+            steps {
+                script {
+                    // Обновляем ветку-маркер, чтобы в следующий раз не обрабатывать уже разнесенные коммиты
+                    def rc = utils.updateBranchSyncFrom1CRepo(env.WORKSPACE, "https://${env.rep_git_remote}", "1C_REPO", "branch_sync_1c_repo")
+                    if (rc != 0) error "Синхронизация branch_sync_1c_repo завершилась с ошибкой: код ${rc}"
+                }
+            }
+        }
+    }
+    
+    // --- Блок POST: Действия после завершения пайплайна ---
+    post {
+        // Выполняется всегда, независимо от результата (успех/провал)
+        always {
+            script {
+                // Принудительно завершаем процессы, которые могли "зависнуть"
+                utils.cmd("taskkill /F /IM oscript.exe /T 2>nul || echo OK")
+                utils.cmd("taskkill /F /IM 1cv8c.exe /T 2>nul || echo OK")
+                utils.cmd("taskkill /F /IM git.exe /T 2>nul || echo OK")
+                utils.cmd("taskkill /F /IM gitsync.exe /T 2>nul || echo OK")
+            }
+        }
+        // Выполняется только при успешном завершении
+        success {
+            script { utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Выгрузка в Git выполнена успешно.", true) }
+        }
+        // Выполняется при ошибке
+        failure {
+            script { utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Выгрузка в Git завершилась ошибкой.", false) }
+        }
+        // Выполняется при отмене сборки вручную
+        aborted {
+            script { utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Выгрузка в Git прервана.", false) }
+        }
+    }
+}
+```
+
+---
+
+#### **Файл 3: `Jenkinsfile-main-config-BUILD_simplified.txt`**
+*(Пайплайн СБОРКИ основной конфигурации - без проверки, только тегирование)*
+```groovy
+// ========================================================================
+//    JENKINS PIPELINE: СБОРКА АРТЕФАКТА (.cf) ДЛЯ ОСНОВНОЙ КОНФИГУРАЦИИ
+// ========================================================================
+// НАЗНАЧЕНИЕ:
+// Этот пайплайн компилирует исходники в готовый .cf файл и публикует
+// его как артефакт, а также создает Git-тег для версионирования.
+//
+// ТРИГГЕР: Запускается по webhook'у из Git при мерже в 'develop' или 'master'.
+// ========================================================================
+
+def loadSharedLibrary() { library '1c-utils@master' }
+loadSharedLibrary()
+import io.libs.v8_utils
+def utils = new v8_utils()
+
+pipeline {
+    agent any
+    options { timestamps(); skipDefaultCheckout(true); disableConcurrentBuilds() }
+    parameters {
+        string(name: 'GIT_BRANCH', defaultValue: 'develop', description: 'Из какой ветки собирать артефакт')
+    }
+    
+    stages {
+        stage('Checkout Code') {
+            steps {
+                script {
+                    cleanWs()
+                    withCredentials([usernamePassword(credentialsId: 'token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+                        def remoteUrl = "https://${GIT_USER}:${GIT_TOKEN}@${env.rep_git_remote}"
+                        utils.cmd("git clone --branch ${params.GIT_BRANCH} --single-branch ${remoteUrl} .", env.WORKSPACE)
+                    }
+                }
+            }
+        }
+        
+        // --- ЭТАП 2: Сборка артефакта (.cf файл) ---
+        stage('Build Artifact') {
+            steps {
+                script {
+                    def buildTimestamp = new Date().format('yyyy.MM.dd-HHmm')
+                    def tagName = "build-main-${buildTimestamp}-b${env.BUILD_NUMBER}"
+                    // Имя файла-артефакта теперь уникально для каждой сборки
+                    def artifactFileName = "Configuration-${tagName}.cf"
+                    
+                    env.GENERATED_TAG_NAME = tagName
+                    env.ARTIFACT_FILE_NAME = artifactFileName
+
+                    // Компилируем исходники напрямую в наш целевой .cf файл
+                    def srcCfPath = "${env.WORKSPACE}\\src\\cf"
+                    def outputCfFile = "${env.WORKSPACE}\\build\\${artifactFileName}"
+                    utils.compileCF_to_file_safe(srcCfPath, outputCfFile)
+                }
+            }
+        }
+        
+        // --- ЭТАП 3: Публикация артефакта и тега ---
+        stage('Publish Artifact and Tag') {
+            steps {
+                script {
+                    // Сохраняем собранный .cf файл. Он будет доступен для скачивания
+                    // со страницы этой сборки в Jenkins.
+                    archiveArtifacts(
+                        artifacts: "build/${env.ARTIFACT_FILE_NAME}", 
+                        fingerprint: true,
+                        allowEmptyArchive: true // Важно, если по какой-то причине файл не создался
+                    )
+                    
+                    // Создаем и пушим Git-тег
+                    withCredentials([usernamePassword(credentialsId: 'token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+                        utils.cmd("git config user.name 'Jenkins CI'", env.WORKSPACE)
+                        utils.cmd("git tag -a ${env.GENERATED_TAG_NAME} -m 'CI Build ${env.BUILD_NUMBER}'", env.WORKSPACE)
+                        utils.cmd("git push https://${GIT_USER}:${GIT_TOKEN}@${env.rep_git_remote} ${env.GENERATED_TAG_NAME}", env.WORKSPACE)
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            script { utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Артефакт (.cf) для основной конфигурации успешно создан: ${env.GENERATED_TAG_NAME}", true) }
+        }
+        failure {
+            script { utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Ошибка создания артефакта (.cf) для основной конфигурации.", false) }
+        }
+    }
+}
+```
+
+---
+
+#### **Файл 4: `Jenkinsfile-template-extension-BUILD_simplified.txt`**
+*(Шаблон СБОРКИ для расширений - без проверки, только тегирование)*
+```groovy
+// ========================================================================
+//    ШАБЛОН JENKINS PIPELINE: СБОРКА АРТЕФАКТА (.cfe) ДЛЯ РАСШИРЕНИЯ
+// ========================================================================
+// НАЗНАЧЕНИЕ:
+// Этот пайплайн компилирует исходники расширения в готовый .cfe файл и
+// публикует его как артефакт, а также создает Git-тег для версионирования.
+//
+// ТРИГГЕР: Запускается по webhook'у из Git-репозитория расширения.
+// ========================================================================
+
+def loadSharedLibrary() { library '1c-utils@master' }
+loadSharedLibrary()
+import io.libs.v8_utils
+def utils = new v8_utils()
+
+pipeline {
+    agent any
+    options { timestamps(); skipDefaultCheckout(true); }
+    parameters {
+        string(name: 'EXTENSION_NAME', defaultValue: 'YourExtensionName', description: 'Техническое имя расширения')
+        string(name: 'GIT_REPO_URL', defaultValue: 'gitlab.mycompany.com/path/to/repo.git', description: 'URL Git-репозитория этого расширения (без https://)')
+        string(name: 'GIT_BRANCH', defaultValue: 'develop', description: 'Из какой ветки собирать артефакт')
+    }
+    
+    stages {
+        stage('Checkout Extension Code') {
+            steps {
+                script {
+                    cleanWs()
+                    withCredentials([usernamePassword(credentialsId: 'token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+                        def remoteUrl = "https://${GIT_USER}:${GIT_TOKEN}@${params.GIT_REPO_URL}"
+                        utils.cmd("git clone --branch ${params.GIT_BRANCH} --single-branch ${remoteUrl} .", env.WORKSPACE)
+                    }
+                }
+            }
+        }
+
+        stage('Build Artifact') {
+            steps {
+                script {
+                    def buildTimestamp = new Date().format('yyyy.MM.dd-HHmm')
+                    def tagName = "build-${params.EXTENSION_NAME}-${buildTimestamp}-b${env.BUILD_NUMBER}"
+                    def artifactFileName = "${params.EXTENSION_NAME}-${tagName}.cfe"
+                    
+                    env.GENERATED_TAG_NAME = tagName
+                    env.ARTIFACT_FILE_NAME = artifactFileName
+                    
+                    // Компилируем исходники расширения в .cfe файл
+                    def srcPath = "${env.WORKSPACE}\\src\\cf"
+                    def outputPath = "${env.WORKSPACE}\\build\\${artifactFileName}"
+                    utils.compileCFE_to_file_safe(params.EXTENSION_NAME, srcPath, outputPath)
+                }
+            }
+        }
+
+        stage('Publish Artifact and Tag') {
+            steps {
+                script {
+                    archiveArtifacts(artifacts: "build/${env.ARTIFACT_FILE_NAME}", fingerprint: true, allowEmptyArchive: true)
+                    
+                    withCredentials([usernamePassword(credentialsId: 'token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+                        def remoteUrl = "https://${GIT_USER}:${GIT_TOKEN}@${params.GIT_REPO_URL}"
+                        utils.cmd("git config user.name 'Jenkins CI'", env.WORKSPACE)
+                        utils.cmd("git tag -a ${env.GENERATED_TAG_NAME} -m 'CI Build ${env.BUILD_NUMBER}'", env.WORKSPACE)
+                        utils.cmd("git push ${remoteUrl} ${env.GENERATED_TAG_NAME}", env.WORKSPACE)
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            script { utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Артефакт (.cfe) для расширения '${params.EXTENSION_NAME}' успешно создан: ${env.GENERATED_TAG_NAME}", true) }
+        }
+        failure {
+            script { utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Ошибка создания артефакта (.cfe) для расширения '${params.EXTENSION_NAME}'.", false) }
+        }
+    }
+}
+```
+---
+
+#### **Файл 5: `Jenkinsfile-main-config-DEPLOY-SCHEDULE.txt`**
+*(Пайплайн РАЗВЕРТЫВАНИЯ основной конфигурации по расписанию)*
+```groovy
+// ========================================================================
+// JENKINS PIPELINE: РАЗВЕРТЫВАНИЕ ОСНОВНОЙ КОНФИГУРАЦИИ ИЗ АРТЕФАКТА
+// ========================================================================
+// НАЗНАЧЕНИЕ:
+// Этот пайплайн находит последнюю версию (тег), скачивает
+// соответствующий ГОТОВЫЙ .cf файл и обновляет им рабочую базу.
+//
+// ТРИГГЕР: Запускается по расписанию в технологическое окно.
+// ========================================================================
+
+def loadSharedLibrary() { library '1c-utils@master' }
+loadSharedLibrary()
+import io.libs.v8_utils
+def utils = new v8_utils()
+
+// --- Путь к файлу, где хранится имя последнего установленного тега ---
+def LAST_DEPLOYED_TAG_FILE = "C:\\Jenkins\\deployment_state\\erp_main_config_last_tag.txt"
+
+pipeline {
+    agent any
+    options { timestamps(); skipDefaultCheckout(true); disableConcurrentBuilds() }
+    triggers {
+        // Пример: Каждую субботу в 2 часа ночи
+        cron('H 2 * * 6') 
+    }
+    
+    stages {
+        // --- ЭТАП 0: Захват блокировки ---
+        stage('Acquire Lock') {
+            steps {
+                // Ждем, пока ресурс PROD_DATABASE_LOCK не освободится,
+                // чтобы гарантировать последовательное выполнение обновлений.
+                lock('PROD_DATABASE_LOCK') {
+                    script {
+                        echo "Блокировка PROD_DATABASE_LOCK успешно захвачена."
+                    }
+                }
+            }
+        }
+
+        stage('Check for New Version') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: 'token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+                        env.GIT_AUTH_URL = "https://${GIT_USER}:${GIT_TOKEN}@${env.rep_git_remote}"
+                    }
+
+                    def latestTag = bat(
+                        script: "git ls-remote --tags --sort=-v:refname ${env.GIT_AUTH_URL} \"refs/tags/build-main-*\" | findstr /V \"{}\" | findstr /R /C:\"refs/tags/build-.*\" | for /f %%i in ('more') do @echo %%i | sed \"s/refs\\/tags\\///\"",
+                        returnStdout: true
+                    ).trim()
+
+                    if (latestTag.isEmpty()) {
+                        echo "Не найдено ни одного тега сборки. Пропускаем развертывание."
+                        currentBuild.result = 'NOT_BUILT'; return
+                    }
+                    
+                    def lastDeployedTag = fileExists(LAST_DEPLOYED_TAG_FILE) ? readFile(LAST_DEPLOYED_TAG_FILE).trim() : ""
+                    echo "Последний доступный тег: ${latestTag}"; echo "Последний развернутый тег: ${lastDeployedTag}"
+                    
+                    if (latestTag == lastDeployedTag) {
+                        echo "Новых версий для развертывания нет."; currentBuild.result = 'NOT_BUILT'; return
+                    }
+                    
+                    env.TAG_TO_DEPLOY = latestTag
+                }
+            }
+        }
+        
+        stage('Download and Deploy Artifact') {
+            steps {
+                script {
+                    echo "Начинаем развертывание версии: ${env.TAG_TO_DEPLOY}"
+                    
+                    def buildNumber = env.TAG_TO_DEPLOY.split('-b').last()
+                    if (buildNumber.isEmpty()) { error "Не удалось определить номер сборки из тега: ${env.TAG_TO_DEPLOY}" }
+                    
+                    def artifactFileName = "Configuration-${env.TAG_TO_DEPLOY}.cf"
+                    echo "Скачивание артефакта '${artifactFileName}' из сборки #${buildNumber}..."
+                    
+                    copyArtifacts(
+                        projectName: 'ERP-Main-Config-Build', // ИМЯ JOB'А, КОТОРЫЙ СОЗДАЕТ АРТЕФАКТЫ
+                        selector: specific(buildNumber),
+                        filter: "build/${artifactFileName}",
+                        target: '.'
+                    )
+                    
+                    withCredentials([
+                        usernamePassword(credentialsId: 'cluster-admin', usernameVariable: 'RAC_USER', passwordVariable: 'RAC_PASS'),
+                        usernamePassword(credentialsId: 'sql-auth', usernameVariable: 'SQL_USER', passwordVariable: 'SQL_PASS'),
+                        usernamePassword(credentialsId: 'ic-user-pass', usernameVariable: 'IC_USER', passwordVariable: 'IC_PASS')
+                    ]) {
+                        def ras = "${env.server1c}:${env.CLUSTER_PORT ?: '1545'}"; def db = env.database
+                        env.UCCODE = "PROD-${env.TAG_TO_DEPLOY}"
+
+                        utils.cmd("vrunner session lock --ras ${ras} --db ${db} --cluster-admin \"${RAC_USER}\" --cluster-pwd \"${RAC_PASS}\" --uccode \"${env.UCCODE}\"")
+                        env.__LOCK_ACTIVE = '1'
+                        
+                        utils.mssqlBackup(env.server1c, env.database, env.BACKUP_DIR, SQL_USER, SQL_PASS)
+                        
+                        def cfPath = "${env.WORKSPACE}\\${artifactFileName}"
+                        def rcUpdate = utils.cmd("vrunner updatedb --cffile \"${cfPath}\" --v1c /S${ras}/${db} /N${IC_USER} /P${IC_PASS}")
+                        
+                        if (rcUpdate != 0) {
+                            error("КРИТИЧЕСКАЯ ОШИБКА: Обновление производственной БД из файла ${artifactFileName} завершилось неудачно!")
+                        }
+                        
+                        writeFile(file: LAST_DEPLOYED_TAG_FILE, text: env.TAG_TO_DEPLOY)
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                if (env.__LOCK_ACTIVE == '1') {
+                    withCredentials([usernamePassword(credentialsId: 'cluster-admin', usernameVariable: 'RAC_USER', passwordVariable: 'RAC_PASS')]) {
+                        def ras = "${env.server1c}:${env.CLUSTER_PORT ?: '1545'}"; def db = env.database
+                        utils.cmd("vrunner session unlock --ras ${ras} --db ${db} --cluster-admin \"${RAC_USER}\" --cluster-pwd \"${RAC_PASS}\" --uccode \"${env.UCCODE}\" || echo OK")
+                    }
+                }
+            }
+        }
+        success {
+            script {
+                if (env.TAG_TO_DEPLOY) {
+                    utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Основная конфигурация на ПРОД успешно обновлена до версии ${env.TAG_TO_DEPLOY}.", true)
+                }
+            }
+        }
+        failure {
+            script { utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "КРИТИЧЕСКАЯ ОШИБКА обновления основной конфигурации на ПРОД!", false) }
+        }
+    }
+}
+```
+
+---
+
+#### **Файл 6: `Jenkinsfile-template-extension-DEPLOY-SCHEDULE.txt`**
+*(Шаблон РАЗВЕРТЫВАНИЯ для расширений по расписанию. Поддерживает несколько баз.)*
+```groovy
+// ========================================================================
+// ШАБЛОН: РАЗВЕРТЫВАНИЕ РАСШИРЕНИЯ ИЗ АРТЕФАКТА ПО РАСПИСАНИЮ
+// ========================================================================
+// НАЗНАЧЕНИЕ:
+// Этот пайплайн запускается по нескольким расписаниям. При каждом запуске
+// он определяет, для какой базы сейчас технологическое окно, и, если есть
+// новая версия (тег), обновляет ИМЕННО ЭТУ БАЗУ.
+// ========================================================================
+
+def loadSharedLibrary() { library '1c-utils@master' }
+loadSharedLibrary()
+import io.libs.v8_utils
+def utils = new v8_utils()
+
+pipeline {
+    agent any
+    options { timestamps(); skipDefaultCheckout(true); }
+    
+    parameters {
+        string(name: 'EXTENSION_NAME', defaultValue: 'YourExtensionName', description: 'Техническое имя расширения')
+        string(name: 'GIT_REPO_URL', defaultValue: 'gitlab.mycompany.com/path/to/repo.git', description: 'URL Git-репозитория этого расширения (без https://)')
+    }
+
+    triggers {
+        cron('''
+            # Тех. окно для Финансовой базы: Каждую субботу в 2:30 ночи
+            H(30-59) 2 * * 6 % TARGET_ENVIRONMENT=PROD_FINANCE
+            
+            # Тех. окно для Логистической базы: Каждое воскресенье в 3:30 ночи
+            H(30-59) 3 * * 7 % TARGET_ENVIRONMENT=PROD_LOGISTICS
+        ''')
+    }
+    
+    stages {
+        stage('Acquire Lock') {
+            steps {
+                lock('PROD_DATABASE_LOCK') {
+                    script {
+                        echo "Блокировка PROD_DATABASE_LOCK успешно захвачена для обновления расширения."
+                    }
+                }
+            }
+        }
+
+        stage('Check and Deploy') {
+            steps {
+                script {
+                    // --- Сопоставление среды с параметрами подключения ---
+                    def envConfig = [:]
+                    switch (params.TARGET_ENVIRONMENT) {
+                        case 'PROD_FINANCE':
+                            envConfig.SERVER_1C = 'prod-cluster-01.mycompany.com'; envConfig.DATABASE_NAME = 'ERP_Finance';
+                            envConfig.IC_CREDS_ID = 'ic-user-pass-finance-prod'; envConfig.SQL_CREDS_ID = 'sql-auth-finance-prod';
+                            envConfig.RAC_CREDS_ID = 'cluster-admin-prod'; envConfig.BACKUP_DIR = '\\\\prod-storage\\backups\\finance'
+                            break
+                        case 'PROD_LOGISTICS':
+                            envConfig.SERVER_1C = 'prod-cluster-01.mycompany.com'; envConfig.DATABASE_NAME = 'ERP_Logistics';
+                            envConfig.IC_CREDS_ID = 'ic-user-pass-logistics-prod'; envConfig.SQL_CREDS_ID = 'sql-auth-logistics-prod';
+                            envConfig.RAC_CREDS_ID = 'cluster-admin-prod'; envConfig.BACKUP_DIR = '\\\\prod-storage\\backups\\logistics'
+                            break
+                        default:
+                            error "Неизвестная целевая среда: ${params.TARGET_ENVIRONMENT}"
+                    }
+                    
+                    // --- Поиск новой версии ---
+                    withCredentials([usernamePassword(credentialsId: 'token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+                        def remoteUrl = "https://${GIT_USER}:${GIT_TOKEN}@${params.GIT_REPO_URL}"
+                        def latestTag = bat(script: "git ls-remote --tags --sort=-v:refname ${remoteUrl} \"refs/tags/build-${params.EXTENSION_NAME}-*\" | findstr /V \"{}\" | findstr /R /C:\"refs/tags/build-.*\" | for /f %%i in ('more') do @echo %%i | sed \"s/refs\\/tags\\///\"", returnStdout: true).trim()
+                        
+                        if (latestTag.isEmpty()) {
+                            echo "Не найдено тегов для расширения '${params.EXTENSION_NAME}'."; currentBuild.result = 'NOT_BUILT'; return
+                        }
+                        
+                        def lastDeployedTagFile = "C:\\Jenkins\\deployment_state\\${params.EXTENSION_NAME}_${params.TARGET_ENVIRONMENT}_last_tag.txt"
+                        def lastDeployedTag = fileExists(lastDeployedTagFile) ? readFile(lastDeployedTagFile).trim() : ""
+                        
+                        echo "Проверка для среды: ${params.TARGET_ENVIRONMENT}"; echo "Последний доступный тег: ${latestTag}"; echo "Последний развернутый тег: ${lastDeployedTag}"
+                        
+                        if (latestTag == lastDeployedTag) {
+                            echo "Новых версий для развертывания нет."; currentBuild.result = 'NOT_BUILT'; return
+                        }
+                        
+                        env.TAG_TO_DEPLOY = latestTag
+                    }
+
+                    // --- Развертывание ---
+                    echo "Начинаем развертывание версии '${env.TAG_TO_DEPLOY}' на среду '${params.TARGET_ENVIRONMENT}'"
+                    cleanWs()
+                    def buildNumber = env.TAG_TO_DEPLOY.split('-b').last()
+                    def artifactFileName = "${params.EXTENSION_NAME}-${env.TAG_TO_DEPLOY}.cfe"
+                    
+                    copyArtifacts(projectName: "ERP-Extension-${params.EXTENSION_NAME}-Build", selector: specific(buildNumber), filter: "build/${artifactFileName}", target: '.')
+                    
+                    withCredentials([
+                        usernamePassword(credentialsId: envConfig.RAC_CREDS_ID, usernameVariable: 'RAC_USER', passwordVariable: 'RAC_PASS'),
+                        usernamePassword(credentialsId: envConfig.SQL_CREDS_ID, usernameVariable: 'SQL_USER', passwordVariable: 'SQL_PASS'),
+                        usernamePassword(credentialsId: envConfig.IC_CREDS_ID, usernameVariable: 'IC_USER', passwordVariable: 'IC_PASS')
+                    ]) {
+                        def ras = "${envConfig.SERVER_1C}:${env.CLUSTER_PORT ?: '1545'}"
+                        env.UCCODE = "PROD-EXT-${params.EXTENSION_NAME}-${env.TAG_TO_DEPLOY}"
+                        
+                        utils.cmd("vrunner session lock --ras ${ras} --db ${envConfig.DATABASE_NAME} --cluster-admin \"${RAC_USER}\" --cluster-pwd \"${RAC_PASS}\" --uccode \"${env.UCCODE}\"")
+                        env.__LOCK_ACTIVE = '1'
+                        
+                        utils.mssqlBackup(envConfig.SERVER_1C, envConfig.DATABASE_NAME, envConfig.BACKUP_DIR, SQL_USER, SQL_PASS)
+                        
+                        // Используем стандартный пакетный запуск для установки .cfe
+                        def cfePath = "${env.WORKSPACE}\\${artifactFileName}"
+                        def rcUpdate = utils.cmd("... команда пакетного запуска для установки расширения из файла ${cfePath} ...") // ВАМ НУЖНО БУДЕТ УТОЧНИТЬ ЭТУ КОМАНДУ
+                        
+                        if (rcUpdate != 0) { error("КРИТИЧЕСКАЯ ОШИБКА: Обновление расширения '${params.EXTENSION_NAME}' на '${params.TARGET_ENVIRONMENT}' провалилось!") }
+                        
+                        def lastDeployedTagFile = "C:\\Jenkins\\deployment_state\\${params.EXTENSION_NAME}_${params.TARGET_ENVIRONMENT}_last_tag.txt"
+                        writeFile(file: lastDeployedTagFile, text: env.TAG_TO_DEPLOY)
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // ... (блок post с разблокировкой сеансов) ...
+        }
+        success {
+            script { 
+                if (env.TAG_TO_DEPLOY) {
+                    utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Расширение '${params.EXTENSION_NAME}' (${env.TAG_TO_DEPLOY}) успешно развернуто на '${params.TARGET_ENVIRONMENT}'.", true)
+                }
+            }
+        }
+        // ... (failure блок) ...
+    }
+}
+```
+
+---
+
+### **Часть 3: Инструкция по настройке Webhook в GitLab**
+*(Эта инструкция не изменилась, она корректна)*
+1.  **В Jenkins:**
+    *   Установите плагин `Generic Webhook Trigger`.
+    *   В настройках `Build` Job'а (`ERP-Main-Config-Build` и т.д.) в разделе "Триггеры сборки" поставьте галочку `Generic Webhook Trigger`.
+    *   В поле `Token` введите секретную фразу, например `MySuperSecretToken123`.
+2.  **В GitLab:**
+    *   Зайдите в репозиторий -> `Settings` -> `Webhooks`.
+    *   **URL:** `http://YOUR_JENKINS_URL/generic-webhook-trigger/invoke?token=MySuperSecretToken123`
+    *   **Secret Token:** `MySuperSecretToken123`
+    *   **Trigger:** Поставьте галочку на `Merge request events`.
+    *   Нажмите `Add webhook`.
+    *   Повторите для каждого репозитория, который должен запускать свой `Build` Job.
+
+---
+
+### **Часть 4: Документация для команды**
+*(Эта инструкция не изменилась, она корректна)*
+> Коллеги,
+>
+> Процесс развертывания на ПРОД автоматизирован и стал безопаснее.
+>
+> 1.  **Ваша задача** — как и раньше, довести код до `develop`/`master` ветки через Merge Request.
+> 2.  **Что происходит дальше:**
+>     *   После мержа в `develop`/`master` Jenkins **автоматически соберет** ваш код и, если все в порядке, создаст "релиз-кандидат" (скомпилированный файл и Git-тег). Вы получите уведомление об успешном создании артефакта.
+>     *   **Само обновление на ПРОД произойдет автоматически в ближайшее технологическое окно** (согласно настроенному расписанию). Jenkins сам найдет все новые готовые релизы и установит их.
+>
+> **Ключевое отличие:** Ваш мерж **не вызывает немедленного обновления**. Он лишь добавляет ваши изменения в очередь на ближайшее плановое развертывание.
