@@ -1,7 +1,11 @@
 // ========================================================================
-// ШАБЛОН: РАЗВЕРТЫВАНИЕ РАСШИРЕНИЯ ПО РАСПИСАНИЮ
+//    ШАБЛОН JENKINS PIPELINE: СБОРКА АРТЕФАКТА (.cfe) ДЛЯ РАСШИРЕНИЯ
 // ========================================================================
-// ТРИГГЕР: Запускается СТРОГО ПО РАСПИСАНИЮ в технологическое окно.
+// НАЗНАЧЕНИЕ:
+// Этот пайплайн компилирует исходники расширения в готовый .cfe файл и
+// публикует его как артефакт, а также создает Git-тег для версионирования.
+//
+// ТРИГГЕР: Запускается по webhook'у из Git-репозитория расширения.
 // ========================================================================
 
 def loadSharedLibrary() { library '1c-utils@master' }
@@ -11,95 +15,54 @@ def utils = new v8_utils()
 
 pipeline {
     agent any
-    options { timestamps(); skipDefaultCheckout(true); disableConcurrentBuilds() }
-    
-    // --- Параметры, специфичные для этого расширения ---
+    options { timestamps(); skipDefaultCheckout(true); }
     parameters {
         string(name: 'EXTENSION_NAME', defaultValue: 'YourExtensionName', description: 'Техническое имя расширения')
         string(name: 'GIT_REPO_URL', defaultValue: 'gitlab.mycompany.com/path/to/repo.git', description: 'URL Git-репозитория этого расширения (без https://)')
-    }
-
-    // --- Запуск по расписанию (cron) ---
-    triggers {
-        cron('H 2 * * 6') // Пример: Каждую субботу в 2 часа ночи
+        string(name: 'GIT_BRANCH', defaultValue: 'develop', description: 'Из какой ветки собирать артефакт')
     }
     
-    // --- Путь к файлу, где хранится имя последнего установленного тега ДЛЯ ЭТОГО РАСШИРЕНИЯ ---
-    // ВАЖНО: Для каждого расширения должен быть свой файл!
-    // Мы определяем его здесь, чтобы можно было использовать параметр EXTENSION_NAME
-    def properties(Map config) {
-        // Устанавливаем путь к файлу состояния как свойство пайплайна
-        properties([
-            buildDiscarder(logRotator(numToKeepStr: '10')),
-            parameters(config.parameters),
-            pipelineTriggers(config.triggers)
-        ])
-        env.LAST_DEPLOYED_TAG_FILE = "C:\\Jenkins\\deployment_state\\erp_extension_${config.parameters[0].defaultValue}_last_tag.txt"
-    }
-
     stages {
-        // --- ЭТАП 1: Определение версии для развертывания ---
-        stage('Check for New Version') {
+        stage('Checkout Extension Code') {
             steps {
                 script {
+                    cleanWs()
                     withCredentials([usernamePassword(credentialsId: 'token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
-                        env.GIT_AUTH_URL = "https://${GIT_USER}:${GIT_TOKEN}@${params.GIT_REPO_URL}"
+                        def remoteUrl = "https://${GIT_USER}:${GIT_TOKEN}@${params.GIT_REPO_URL}"
+                        utils.cmd("git clone --branch ${params.GIT_BRANCH} --single-branch ${remoteUrl} .", env.WORKSPACE)
                     }
-
-                    // Получаем имя самого последнего тега сборки из Git для этого расширения
-                    def latestTag = bat(
-                        script: "git ls-remote --tags --sort=-v:refname ${env.GIT_AUTH_URL} \"refs/tags/build-${params.EXTENSION_NAME}-*\" | findstr /V \"{}\" | findstr /R /C:\"refs/tags/build-.*\" | for /f %%i in ('more') do @echo %%i | sed \"s/refs\\/tags\\///\"",
-                        returnStdout: true
-                    ).trim()
-
-                    if (latestTag.isEmpty()) {
-                        echo "Не найдено ни одного тега сборки для расширения '${params.EXTENSION_NAME}'. Пропускаем."
-                        currentBuild.result = 'NOT_BUILT'; return
-                    }
-                    
-                    def lastDeployedTag = fileExists(env.LAST_DEPLOYED_TAG_FILE) ? readFile(env.LAST_DEPLOYED_TAG_FILE).trim() : ""
-                    echo "Последний доступный тег: ${latestTag}"; echo "Последний развернутый тег: ${lastDeployedTag}"
-                    
-                    if (latestTag == lastDeployedTag) {
-                        echo "Новых версий для развертывания нет."; currentBuild.result = 'NOT_BUILT'; return
-                    }
-                    
-                    env.TAG_TO_DEPLOY = latestTag
                 }
             }
         }
-        
-        // --- ЭТАП 2: Развертывание новой версии ---
-        stage('Deploy New Version') {
+
+        stage('Build Artifact') {
             steps {
                 script {
-                    echo "Начинаем развертывание расширения '${params.EXTENSION_NAME}' версии: ${env.TAG_TO_DEPLOY}"
+                    def buildTimestamp = new Date().format('yyyy.MM.dd-HHmm')
+                    def tagName = "build-${params.EXTENSION_NAME}-${buildTimestamp}-b${env.BUILD_NUMBER}"
+                    def artifactFileName = "${params.EXTENSION_NAME}-${tagName}.cfe"
                     
-                    cleanWs()
-                    utils.cmd("git clone --branch ${env.TAG_TO_DEPLOY} --single-branch ${env.GIT_AUTH_URL} .", env.WORKSPACE)
+                    env.GENERATED_TAG_NAME = tagName
+                    env.ARTIFACT_FILE_NAME = artifactFileName
+                    
+                    // Компилируем исходники расширения в .cfe файл
+                    def srcPath = "${env.WORKSPACE}\\src\\cf"
+                    def outputPath = "${env.WORKSPACE}\\build\\${artifactFileName}"
+                    utils.compileCFE_to_file_safe(params.EXTENSION_NAME, srcPath, outputPath)
+                }
+            }
+        }
 
-                    withCredentials([
-                        usernamePassword(credentialsId: 'cluster-admin', usernameVariable: 'RAC_USER', passwordVariable: 'RAC_PASS'),
-                        usernamePassword(credentialsId: 'sql-auth', usernameVariable: 'SQL_USER', passwordVariable: 'SQL_PASS'),
-                        usernamePassword(credentialsId: 'ic-user-pass', usernameVariable: 'IC_USER', passwordVariable: 'IC_PASS'),
-                        usernamePassword(credentialsId: 'sql-auth', usernameVariable: 'DB_USER', passwordVariable: 'DB_PASS')
-                    ]) {
-                        // --- Подготовка ---
-                        def ras = "${env.server1c}:${env.CLUSTER_PORT ?: '1545'}"; def db = env.database
-                        env.UCCODE = "PROD-EXT-${params.EXTENSION_NAME}-${env.TAG_TO_DEPLOY}"
-                        
-                        // --- Блокировка, Бэкап, Обновление, Разблокировка ---
-                        utils.cmd("vrunner session lock --ras ${ras} --db ${db} --cluster-admin \"${RAC_USER}\" --cluster-pwd \"${RAC_PASS}\" --uccode \"${env.UCCODE}\"")
-                        env.__LOCK_ACTIVE = '1'
-                        utils.mssqlBackup(env.server1c, env.database, env.BACKUP_DIR, SQL_USER, SQL_PASS)
-
-                        env.IC_USER = IC_USER; env.IC_PASS = IC_PASS;
-                        env.DB_USER = DB_USER; env.DB_PASS = DB_PASS;
-                        def rc = utils.buildCFE(params.EXTENSION_NAME, env.WORKSPACE, env.UCCODE, env.v8_version ?: '8.3.26.1540', false)
-                        if (rc != 0) error("КРИТИЧЕСКАЯ ОШИБКА: Обновление расширения '${params.EXTENSION_NAME}' на проде провалилось!")
-                        
-                        // Если обновление прошло успешно, записываем новый тег в файл состояния
-                        writeFile(file: env.LAST_DEPLOYED_TAG_FILE, text: env.TAG_TO_DEPLOY)
+        stage('Publish Artifact and Tag') {
+            steps {
+                script {
+                    archiveArtifacts(artifacts: "build/${env.ARTIFACT_FILE_NAME}", fingerprint: true, allowEmptyArchive: true)
+                    
+                    withCredentials([usernamePassword(credentialsId: 'token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+                        def remoteUrl = "https://${GIT_USER}:${GIT_TOKEN}@${params.GIT_REPO_URL}"
+                        utils.cmd("git config user.name 'Jenkins CI'", env.WORKSPACE)
+                        utils.cmd("git tag -a ${env.GENERATED_TAG_NAME} -m 'CI Build ${env.BUILD_NUMBER}'", env.WORKSPACE)
+                        utils.cmd("git push ${remoteUrl} ${env.GENERATED_TAG_NAME}", env.WORKSPACE)
                     }
                 }
             }
@@ -107,24 +70,11 @@ pipeline {
     }
     
     post {
-        always {
-            script {
-                if (env.__LOCK_ACTIVE == '1') {
-                    withCredentials([usernamePassword(credentialsId: 'cluster-admin', usernameVariable: 'RAC_USER', passwordVariable: 'RAC_PASS')]) {
-                        def ras = "${env.server1c}:${env.CLUSTER_PORT ?: '1545'}"; def db = env.database
-                        utils.cmd("vrunner session unlock --ras ${ras} --db ${db} --cluster-admin \"${RAC_USER}\" --cluster-pwd \"${RAC_PASS}\" --uccode \"${env.UCCODE}\" || echo OK")
-                    }
-                }
-            }
-        }
         success {
-            script { 
-                if (env.TAG_TO_DEPLOY) {
-                    utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Расширение '${params.EXTENSION_NAME}' на ПРОД успешно обновлено до версии ${env.TAG_TO_DEPLOY}.", true)
-                }
-            }
+            script { utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Артефакт (.cfe) для расширения '${params.EXTENSION_NAME}' успешно создан: ${env.GENERATED_TAG_NAME}", true) }
         }
         failure {
-            script { utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "КРИТИЧЕСКАЯ ОШИБКА обновления расширения '${params.EXTENSION_NAME}' на ПРОД!", false) }
+            script { utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Ошибка создания артефакта (.cfe) для расширения '${params.EXTENSION_NAME}'.", false) }
         }
     }
+}
