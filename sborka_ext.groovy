@@ -61,7 +61,7 @@ pipeline {
                     withCredentials([usernamePassword(credentialsId: 'token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
                         def remoteUrl = "https://${GIT_USER}:${GIT_TOKEN}@${params.GIT_REPO_URL}"
                         utils.cmd("git config user.name 'Jenkins CI'", env.WORKSPACE)
-                        utils.cmd("git tag -a ${env.GENERATED_TAG_NAME} -m 'CI Build ${env.BUILD_NUMBER}'", env.WORKSPACE)
+                        utils.cmd("git tag -a ${env.GENERATED_TAG_NAME} -m \"CI Build ${env.BUILD_NUMBER}\"", env.WORKSPACE)
                         utils.cmd("git push ${remoteUrl} ${env.GENERATED_TAG_NAME}", env.WORKSPACE)
                     }
                 }
