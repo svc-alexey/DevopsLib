@@ -44,6 +44,27 @@ def ensureDirs(String... dirs) {
     return 0
 }
 
+/**
+ * Парсит JSON-файл с описанием расширений.
+ * @param jsonContent Содержимое JSON-файла в виде строки.
+ * @return Список объектов, где каждый объект описывает одно расширение.
+ */
+@NonCPS
+def parseExtensionsJson(String jsonContent) {
+    def config = new groovy.json.JsonSlurper().parseText(jsonContent)
+    def result = []
+    if (config?.extensions) {
+        config.extensions.each { ext ->
+            result.add([
+                name: ext.name.toString(),
+                repo: ext.repo.toString(),
+                path: ext.path.toString()
+            ])
+        }
+    }
+    return result
+}
+
 // ========================================================================
 // Git-утилиты
 // ========================================================================
