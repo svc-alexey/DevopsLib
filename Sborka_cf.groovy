@@ -15,7 +15,7 @@ def utils = new v8_utils()
 
 pipeline {
     agent any
-    options { timestamps(); skipDefaultCheckout(true); disableConcurrentBuilds() }
+    options { timestamps(); skipDefaultCheckout(true); disableConcurrentBuilds(); retry(3)}
     parameters {
         string(name: 'GIT_BRANCH', defaultValue: 'master', description: 'Из какой ветки собирать артефакт')
     }
@@ -68,7 +68,7 @@ pipeline {
                     // Создаем и пушим Git-тег
                     withCredentials([usernamePassword(credentialsId: 'token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
                         utils.cmd("git config user.name 'Jenkins CI'", env.WORKSPACE)
-                        utils.cmd("git tag -a ${env.GENERATED_TAG_NAME} -m 'CI Build ${env.BUILD_NUMBER}'", env.WORKSPACE)
+                        utils.cmd("git tag -a ${env.GENERATED_TAG_NAME} -m \"CI Build ${env.BUILD_NUMBER}\"", env.WORKSPACE)
                         utils.cmd("git push https://${GIT_USER}:${GIT_TOKEN}@${env.rep_git_remote} ${env.GENERATED_TAG_NAME}", env.WORKSPACE)
                     }
                 }

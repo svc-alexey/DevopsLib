@@ -40,6 +40,7 @@ pipeline {
     options {
         timestamps() // Добавлять временные метки в лог
         disableConcurrentBuilds() // Запретить параллельный запуск этого пайплайна
+        retry(3)
     }
 
     stages {
@@ -126,16 +127,6 @@ pipeline {
     
     // --- Блок POST: Действия после завершения пайплайна ---
     post {
-        // Выполняется всегда, независимо от результата (успех/провал)
-        always {
-            script {
-                // Принудительно завершаем процессы, которые могли "зависнуть"
-                utils.cmd("taskkill /F /IM oscript.exe /T 2>nul || echo OK")
-                utils.cmd("taskkill /F /IM 1cv8c.exe /T 2>nul || echo OK")
-                utils.cmd("taskkill /F /IM git.exe /T 2>nul || echo OK")
-                utils.cmd("taskkill /F /IM gitsync.exe /T 2>nul || echo OK")
-            }
-        }
         // Выполняется только при успешном завершении
         success {
             script { utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Выгрузка в Git выполнена успешно.", true) }

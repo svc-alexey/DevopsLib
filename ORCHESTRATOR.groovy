@@ -29,12 +29,7 @@ def ENV_CONFIG = [
 
 pipeline {
     agent any
-    options { timestamps(); skipDefaultCheckout(true); disableConcurrentBuilds() }
-    
-    triggers {
-        // [!! НАСТРОЙКА !!] Укажите технологическое окно для ЭТОЙ СРЕДЫ
-        cron('H 2 * * 6') 
-    }
+    options { timestamps(); skipDefaultCheckout(true); disableConcurrentBuilds(); rety(3) }
     
     stages {
         stage('Acquire Global Lock') {
