@@ -317,6 +317,77 @@ def telegram_send_message(TOKEN, CHAT_ID, messageText, success) {
 
 /** ---------------------- BACKUP --------------------- */
 
+/**
+ * Бэкап MSSQL базы в конкретный файл
+ */
+def mssqlBackupToFile(String server, String dbName, String fullBackupPath, String sqlUser, String sqlPass) {
+    ensureDirs(new File(fullBackupPath).getParent())
+    def script = """
+        sqlcmd -S "${server}" -U "${sqlUser}" -P "${sqlPass}" -b -Q "BACKUP DATABASE [${dbName}] TO DISK='${fullBackupPath}' WITH COPY_ONLY, INIT, COMPRESSION, STATS=5"
+        exit /b %errorlevel%
+    """.trim()
+    def rc = bat(script: "chcp 65001 > nul\n${script}", returnStatus: true)
+    if (rc != 0) error "Ошибка резервного копирования MSSQL в файл ${fullBackupPath}"
+    return rc
+}
+
+/**
+ * Восстановление MSSQL базы из файла (.bak)
+ * ВНИМАНИЕ: Перезаписывает существующую базу (WITH REPLACE) и сбрасывает соединения!
+ */
+def mssqlRestore(String server, String dbName, String fullBackupPath, String sqlUser, String sqlPass) {
+    if (!fileExists(fullBackupPath)) {
+        // Если путь сетевой, fileExists может врать, но попробуем довериться sqlcmd.
+        // Но лучше проверить, если это локальный путь. Для сетевого шары Jenkins может не видеть, а SQL видеть.
+        // Оставим проверку на совесть sqlcmd, или добавим check.
+        echo "Внимание: Файл бэкапа ${fullBackupPath} будет передан SQL серверу для восстановления."
+    }
+
+    // Скрипт:
+    // 1. Перевод в SINGLE_USER с ROLLBACK IMMEDIATE (киляем сессии)
+    // 2. RESTORE DATABASE ... WITH REPLACE
+    // 3. Перевод обратно в MULTI_USER (обычно restore сам делает, но на всякий случай)
+    
+    // Важно: нужно знать логические имена файлов (Move 'LogicalName' TO 'PhysicalFile'), 
+    // если пути на серверах отличаются.
+    // Пока предположим, что пути дефолтные или совпадают, либо используем просто REPLACE если имена файлов совпадают.
+    // Если пути разные, restore может упасть.
+    // Для надежности часто делают RESTORE FILELISTONLY, парсят, и подставляют MOVE.
+    // Но для начала сделаем простой RESTORE WITH REPLACE. Если упадет - будем усложнять.
+    
+    def script = """
+        sqlcmd -S "${server}" -U "${sqlUser}" -P "${sqlPass}" -b -Q "ALTER DATABASE [${dbName}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; RESTORE DATABASE [${dbName}] FROM DISK='${fullBackupPath}' WITH REPLACE; ALTER DATABASE [${dbName}] SET MULTI_USER;"
+        exit /b %errorlevel%
+    """.trim()
+
+    echo "=== Восстановление базы '${dbName}' из '${fullBackupPath}' на сервере '${server}' ==="
+    def rc = bat(script: "chcp 65001 > nul\n${script}", returnStatus: true)
+    if (rc != 0) error "Ошибка восстановления MSSQL базы ${dbName}"
+    echo "✅ База '${dbName}' успешно восстановлена."
+    return rc
+}
+
+/**
+ * Очистка лога транзакций (перевод в SIMPLE + shrink)
+ */
+def mssqlShrinkLog(String server, String dbName, String sqlUser, String sqlPass) {
+    echo "=== Очистка лога транзакций базы '${dbName}' ==="
+    // Переводим в SIMPLE и делаем SHRINKDATABASE (TRUNCATEONLY), чтобы срезать лог.
+    // Для боевых баз лучше быть осторожнее, но для Pre-Prod - это норма.
+    def script = """
+        sqlcmd -S "${server}" -U "${sqlUser}" -P "${sqlPass}" -b -Q "ALTER DATABASE [${dbName}] SET RECOVERY SIMPLE; DBCC SHRINKDATABASE ([${dbName}], 10, TRUNCATEONLY);"
+        exit /b %errorlevel%
+    """.trim()
+
+    def rc = bat(script: "chcp 65001 > nul\n${script}", returnStatus: true)
+    if (rc != 0) {
+        echo "⚠️ Ошибка при очистке лога транзакций (код ${rc}). Не критично."
+    } else {
+        echo "✅ Лог транзакций очищен."
+    }
+    return rc
+}
+
 /** Бэкап MSSQL базы (перед деплоем) */
 def mssqlBackup(String server, String dbName, String backupDir, String sqlUser, String sqlPass) {
     ensureDirs(backupDir)
