@@ -17,7 +17,7 @@ pipeline {
         STATE_DIR      = 'D:\\DevOps\\deployment_state\\ERP'
         CF_STATE_FILE  = "${STATE_DIR}\\${params.IB_NAME}_cf_tag.txt"
         EXT_STATE_DIR  = "${STATE_DIR}\\extensions"
-        BACKUP_DIR     = '\\\\opl-dc01-sqlc3\\backup_base\\BACKUP\\NO_DELETE'
+        BACKUP_DIR     = '\\\\opl-dc01-sqlc3\\backup_base\\BACKUP\\ERP\\DAILY' 
         MANIFEST_FILE  = "${WORKSPACE}\\extension-prod.json"
 
         // чисто информативно, для логов
