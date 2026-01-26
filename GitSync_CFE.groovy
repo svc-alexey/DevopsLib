@@ -16,7 +16,7 @@ def utils = new v8_utils()
 
 pipeline {
     agent { label 'localhost' }
-    options { timestamps(); disableConcurrentBuilds(); retry(3) }
+    options { timestamps(); disableConcurrentBuilds();}
 
     stages {
         stage('Checkout Source Code') {
@@ -81,6 +81,10 @@ pipeline {
         }
 
         stage('Sync branch_sync_1c_repo') {
+            when {
+                // Если нет новых коммитов, не трогаем служебную ветку и не пушим
+                expression { env.GITSYNC_NO_NEW_COMMITS != 'true' }
+            }
             steps {
                 script {
                     def rc = utils.updateBranchSyncFrom1CRepo(env.WORKSPACE, "https://${params.GIT_REPO_URL}", "1C_REPO", "branch_sync_1c_repo")
@@ -93,7 +97,11 @@ pipeline {
     post {
         success {
             script {
-                utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "✅ Выгрузка расширения ${params.EXTENSION_NAME} в Git выполнена успешно", true)
+                if (env.GITSYNC_NO_NEW_COMMITS == 'true') {
+                    echo "Нет новых коммитов, Telegram-уведомление не отправляем."
+                } else {
+                    utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "✅ Выгрузка расширения ${params.EXTENSION_NAME} в Git выполнена успешно", true)
+                }
             }
         }
         failure {

@@ -40,7 +40,6 @@ pipeline {
     options {
         timestamps() // Добавлять временные метки в лог
         disableConcurrentBuilds() // Запретить параллельный запуск этого пайплайна
-        retry(3)
     }
 
     stages {
@@ -129,15 +128,40 @@ pipeline {
     post {
         // Выполняется только при успешном завершении
         success {
-            script { utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Выгрузка в Git выполнена успешно.", true) }
+            script {
+                if (env.GITSYNC_NO_NEW_COMMITS == 'true') {
+                    echo "Нет новых коммитов, Telegram-уведомление не отправляем."
+                } else {
+                    utils.telegram_send_message(
+                        env.TELEGRAM_CHAT_TOKEN,
+                        env.TELEGRAM_CHAT_ID,
+                        "Выгрузка в Git выполнена успешно.",
+                        true
+                    )
+                }
+            }
         }
         // Выполняется при ошибке
         failure {
-            script { utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Выгрузка в Git завершилась ошибкой.", false) }
+            script {
+                utils.telegram_send_message(
+                    env.TELEGRAM_CHAT_TOKEN,
+                    env.TELEGRAM_CHAT_ID,
+                    "Выгрузка в Git завершилась ошибкой.",
+                    false
+                )
+            }
         }
         // Выполняется при отмене сборки вручную
         aborted {
-            script { utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Выгрузка в Git прервана.", false) }
+            script {
+                utils.telegram_send_message(
+                    env.TELEGRAM_CHAT_TOKEN,
+                    env.TELEGRAM_CHAT_ID,
+                    "Выгрузка в Git прервана.",
+                    false
+                )
+            }
         }
     }
 }

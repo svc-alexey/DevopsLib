@@ -95,7 +95,7 @@ def init_hran(rep_1c, rep_git_local_src_cf, ext = "", server1c = "", repo_user, 
 /**
  * Сборка основной конфигурации (.cf) из исходников src\cf
  */
-def compileCF_to_file_safe(String srcDir, String outputCfFile, String v8version = '8.3.26.1540') {
+def compileCF_to_file_safe(String srcDir, String outputCfFile, String v8version = '8.3.27.1859') {
     ensureDirs(new File(outputCfFile).getParent())
     def cmdline = "vrunner compile --src \"${srcDir}\" --out \"${outputCfFile}\" --v8version \"${v8version}\""
     echo "Компиляция основной конфигурации в файл .cf..."
@@ -107,7 +107,7 @@ def compileCF_to_file_safe(String srcDir, String outputCfFile, String v8version 
 /**
  * Сборка расширения (.cfe) из исходников src\cfe
  */
-def compileCFE_to_file_safe(String extName, String srcDir, String outputCfeFile, String v8version = '8.3.26.1540') {
+def compileCFE_to_file_safe(String extName, String srcDir, String outputCfeFile, String v8version = '8.3.27.1859') {
     ensureDirs(new File(outputCfeFile).getParent())
     def cmdline = "vrunner compileexttocfe --src \"${srcDir}\" --out \"${outputCfeFile}\" --v8version \"${v8version}\""
     echo "Компиляция расширения '${extName}' в файл .cfe..."
@@ -122,56 +122,82 @@ def compileCFE_to_file_safe(String extName, String srcDir, String outputCfeFile,
  * Обновление основной конфигурации (.cf) через ibcmd (предпочтительно)
  * или fallback на vrunner (без --ibcmd, т.к. он не работает корректно).
  */
-def updateDB_via_ibcmd_or_vrunner(String cfFile, String server, String dbName,
-                                  String sqlUser, String sqlPass,
-                                  String v8version = '8.3.26.1540') {
-    if (!fileExists(cfFile)) error "Файл конфигурации не найден: ${cfFile}"
+def updateDB_via_ibcmd_or_vrunner(String cfFile,
+                                  String server,
+                                  String serverSQL,
+                                  String dbName,
+                                  String sqlUser,
+                                  String sqlPass,
+                                  String v8version = '8.3.27.1859') {
+    if (!fileExists(cfFile)) {
+        error "Файл конфигурации не найден: ${cfFile}"
+    }
 
     echo "=== Обновление конфигурации базы '${dbName}' ==="
-    /**
-    def hasIbcmd = (bat(script: "where ibcmd >nul 2>nul", returnStatus: true) == 0)
 
-    if (hasIbcmd) {
-        echo "ibcmd найден — выполняем обновление напрямую."
-        def rc = cmd("""
-            ibcmd infobase config load "${cfFile}" ^
-              --dbms MSSQLServer --db-server="${server}" --db-name="${dbName}" ^
-              --db-user="${sqlUser}" --db-pwd="${sqlPass}" --user="${sqlUser}" --password="${sqlPass}" --force
-            && ibcmd infobase config apply ^
-              --dbms MSSQLServer --db-server="${server}" --db-name="${dbName}" ^
-              --db-user="${sqlUser}" --db-pwd="${sqlPass}" --user="${sqlUser}" --password="${sqlPass}" --force
-        """)
-        if (rc != 0) error "Ошибка при обновлении конфигурации через ibcmd (код ${rc})"
-    } else {
-        echo "ibcmd не найден — fallback на vrunner."
-        def rc = cmd("""
-            vrunner load --src "${cfFile}" \
-              --v8version "${v8version}" \
-              --dbms-type mssql --dbms-server "${server}" --dbms-base "${dbName}" \
-              --dbms-user "${sqlUser}" --dbms-pwd "${sqlPass}" --uccode "ОбновлениеКонфигурации"
-            && vrunner updatedb \
-              --v8version "${v8version}" \
-              --dbms-type mssql --dbms-server "${server}" --dbms-base "${dbName}" \
-              --dbms-user "${sqlUser}" --dbms-pwd "${sqlPass}" --uccode "ОбновлениеКонфигурации"
-        """)
-        if (rc != 0) error "Ошибка при обновлении конфигурации через vrunner (код ${rc})"
+    // 1) Загрузка CF через vrunner
+    def rcLoad = bat(
+        returnStatus: true,
+        script: """
+            @echo off
+            chcp 65001 >nul
+            setlocal enableextensions
+
+            rem Опционально добавим bin платформы в PATH, если нужно
+            if exist "C:\\Program Files\\1cv8\\${v8version}\\bin" (
+                set "PATH=C:\\Program Files\\1cv8\\${v8version}\\bin;%PATH%"
+            )
+
+            echo [1/2] Загрузка CF: %DATE% %TIME%
+            vrunner load ^
+              --src "${cfFile}" ^
+              --v8version "${v8version}" ^
+              --ibconnection "/S${server}\\${dbName}" ^
+              --db-user "${sqlUser}" --db-pwd "${sqlPass}" ^
+              --uccode "ОбновлениеКонфигурации"
+
+            exit /b %ERRORLEVEL%
+        """
+    )
+
+    if (rcLoad != 0) {
+        error "Ошибка при загрузке конфигурации через vrunner (код ${rcLoad})"
     }
-*/
 
-    def rc = cmd("""
-            vrunner load --src "${cfFile}" \
-              --v8version "${v8version}" \
-              --ibconnection "/S${server}\\${dbName}" \
-              --db-user "${sqlUser}" --db-pwd "${sqlPass}" --uccode "ОбновлениеКонфигурации"
-            && ibcmd infobase config apply ^
-              --dbms MSSQLServer --db-server="${server}" --db-name="${dbName}" ^
-              --db-user="${sqlUser}" --db-pwd="${sqlPass}" --user="${sqlUser}" --password="${sqlPass}" --force
-        """)
-        if (rc != 0) error "Ошибка при обновлении конфигурации через vrunner (код ${rc})"
+    // 2) Применение конфигурации через ibcmd
+    def rcApply = bat(
+        returnStatus: true,
+        script: """
+            @echo off
+            chcp 65001 >nul
+            setlocal enableextensions
+
+            rem Опционально добавим bin платформы в PATH, если нужно
+            if exist "C:\\Program Files\\1cv8\\${v8version}\\bin" (
+                set "PATH=C:\\Program Files\\1cv8\\${v8version}\\bin;%PATH%"
+            )
+
+            echo [2/2] Применение конфигурации ibcmd: %DATE% %TIME%
+            ibcmd infobase config apply ^
+              --dbms MSSQLServer ^
+              --db-server="${serverSQL}" ^
+              --db-name="${dbName}" ^
+              --db-user="${sqlUser}" --db-pwd="${sqlPass}" ^
+              --user="${sqlUser}" --password="${sqlPass}" ^
+              --force
+
+            exit /b %ERRORLEVEL%
+        """
+    )
+
+    if (rcApply != 0) {
+        error "Ошибка при применении конфигурации через ibcmd (код ${rcApply})"
+    }
 
     echo "✅ Конфигурация '${dbName}' успешно обновлена."
     return 0
 }
+
 
 /**
  * Установка или обновление расширения (.cfe) через ibcmd (предпочтительно)
@@ -180,7 +206,7 @@ def updateDB_via_ibcmd_or_vrunner(String cfFile, String server, String dbName,
 def updateExtension_via_ibcmd_or_vrunner(String cfePath, String extName,
                                          String server, String dbName,
                                          String sqlUser, String sqlPass,
-                                         String v8version = '8.3.26.1540') {
+                                         String v8version = '8.3.27.1859') {
     if (!fileExists(cfePath)) error "Файл расширения не найден: ${cfePath}"
 
     echo "=== Обновление расширения '${extName}' в базе '${dbName}' ==="
@@ -224,13 +250,70 @@ def updateExtension_via_ibcmd_or_vrunner(String cfePath, String extName,
 
 /** ---------------------- TELEGRAM --------------------- */
 
-/** Простое уведомление в Telegram */
+/** Уведомление в Telegram */
 def telegram_send_message(TOKEN, CHAT_ID, messageText, success) {
-    messageText = (success ? "✅ " : "❌ ") + messageText + "\nСборка: ${env.BUILD_URL}"
-    writeFile file: 'tmp_telegram_message.txt', text: messageText, encoding: 'UTF-8'
-    def command = "chcp 65001 > nul & curl -s -X POST https://api.telegram.org/bot${TOKEN}/sendMessage -d chat_id=${CHAT_ID} --data-urlencode text@tmp_telegram_message.txt"
-    bat(script: command, returnStatus: true)
+    // Префикс по статусу: зелёная галка или красный крестик
+    def prefix = success ? "✅ " : "❌ "
+    messageText = prefix + (messageText ?: "")
+
+    def details = []
+
+    // Ссылка на сборку
+    if (env.BUILD_URL) {
+        details << "Сборка: ${env.BUILD_URL}"
+    }
+
+    // Репозиторий
+    def repoUrl = ""
+    if (env.rep_git_remote?.trim()) {
+        repoUrl = env.rep_git_remote.trim()
+    } else if (env.GIT_REPO_URL?.trim()) {
+        repoUrl = env.GIT_REPO_URL.trim()
+    }
+    if (repoUrl) {
+        if (!repoUrl.toLowerCase().startsWith("http")) {
+            repoUrl = "https://${repoUrl}"
+        }
+        repoUrl = repoUrl.replaceAll(/\.git$/, "")
+        details << "Репозиторий: ${repoUrl}"
+    }
+
+    // Ветки, если переданы
+    def branches = env.GITSYNC_UPDATED_BRANCHES?.trim()
+    if (branches) {
+        details << "Ветки: ${branches}"
+    }
+
+    if (!details.isEmpty()) {
+        messageText = messageText + "\n" + details.join("\n")
+    }
+
+    // Путь к файлу сообщения в текущем workspace
+    def ws = pwd()
+    def msgFile = "${ws}/tmp_telegram_message.txt"
+
+    // Пишем основной текст в файл
+    writeFile file: msgFile, text: messageText, encoding: 'UTF-8'
+
+    // Базовая часть curl-команды
+    def curlBase = "curl -X POST https://api.telegram.org/bot${TOKEN}/sendMessage -d chat_id=${CHAT_ID}"
+
+    def command
+
+    if (fileExists(msgFile)) {
+        // Нормальный сценарий: шлём содержимое файла
+        command = "chcp 65001 > nul & ${curlBase} --data-urlencode text@\"${msgFile}\""
+    } else {
+        // Файл не создался/куда-то делся – шлём запасную строку
+        def fallbackText = "Build success, not file in folder"
+        command = "chcp 65001 > nul & ${curlBase} --data-urlencode \"text=${fallbackText}\""
+    }
+
+    // Логируем ответ от Telegram
+    def out = bat(script: command, returnStdout: true).trim()
+    echo "telegram_send_message response: ${out}"
 }
+
 
 /** ---------------------- BACKUP --------------------- */
 
@@ -302,96 +385,206 @@ def unlockSessions(String ras, String dbName, String racUser, String racPass) {
 // ========================================================================
 
 /**
+ * Проверка, является ли коммит merge-коммитом.
+ * Если у коммита больше одного родителя — это merge.
+ */
+def isMergeCommit(String repoDir, String commit) {
+    git(repoDir, "rev-list --parents -n 1 ${commit} > .git\\parents.txt")
+    def content = readFile(file: "${repoDir}\\.git\\parents.txt", encoding: 'UTF-8').trim()
+    cmd("cd /D \"${repoDir}\" & del /Q .git\\parents.txt 2>nul")
+    if (!content) return false
+    def parts = content.split(/\s+/)
+    return parts.size() > 2
+}
+
+/**
  * Главный метод распределения коммитов из 1C_REPO по feature-веткам.
  * Анализирует новые коммиты, определяет по их тексту номер задачи и выполняет
- * cherry-pick в соответствующую feature-ветку. Автоматически разрешает
- * конфликты в служебных файлах (VERSION, dumplist.txt).
- * @param repoDir Путь к локальному Git-репозиторию.
- * @return 0 при успехе, иначе генерирует error.
+ * cherry-pick в соответствующую feature-ветку.
+ * Приоритет: состояние из хранилища 1С (ветка 1C_REPO / коммит), а не то,
+ * что уже в feature-ветке.
  */
 def cherryPickTasksFrom1CRepo(String repoDir, String remoteHttps, String baseBranch = "1C_REPO", String compareBranch = "branch_sync_1c_repo") {
-    if (!repoDir?.trim()) error "cherryPick: repoDir is empty"
 
+    echo "[cherryPickTasksFrom1CRepo] repoDir=${repoDir}, base=${baseBranch}, compare=${compareBranch}"
+
+    if (!repoDir?.trim()) {
+        error "repoDir не задан для cherryPickTasksFrom1CRepo"
+    }
+
+    // На всякий случай нормализуем fetch
+    git(repoDir, 'config core.commentChar ";"')
+    git(repoDir, 'config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"')
     git(repoDir, "fetch --all --prune")
-    git(repoDir, "checkout -B \"${baseBranch}\" \"origin/${baseBranch}\"")
-    git(repoDir, "checkout -B \"${compareBranch}\" \"origin/${compareBranch}\"")
-    git(repoDir, "checkout \"${baseBranch}\"")
 
-    def pretty = isUnix() ? "%h;%s" : "%%h;%%s"
-    def logCmd = "log --reverse ${compareBranch}..${baseBranch} --pretty=format:\"${pretty}\""
-    
-    def tmpFile = ".git/commit_list.txt"
-    git(repoDir, "${logCmd} > ${tmpFile}")
-    def listContent = readFile(file: "${repoDir}\\${tmpFile}", encoding: 'UTF-8')
-    cmd("cd /D \"${repoDir}\" & del /Q ${tmpFile} 2>nul")
+    // Гарантируем наличие baseBranch
+    def rc = git(repoDir, "show-ref --verify --quiet refs/heads/${baseBranch}")
+    if (rc != 0) {
+        rc = git(repoDir, "show-ref --verify --quiet refs/remotes/origin/${baseBranch}")
+        if (rc != 0) {
+            error "Базовая ветка ${baseBranch} не найдена ни локально, ни в origin"
+        }
+        git(repoDir, "checkout -B \"${baseBranch}\" \"origin/${baseBranch}\"")
+    } else {
+        git(repoDir, "checkout \"${baseBranch}\"")
+    }
+
+    // Гарантируем наличие compareBranch
+    rc = git(repoDir, "show-ref --verify --quiet refs/heads/${compareBranch}")
+    if (rc != 0) {
+        rc = git(repoDir, "show-ref --verify --quiet refs/remotes/origin/${compareBranch}")
+        if (rc == 0) {
+            echo "[cherryPickTasksFrom1CRepo] Локальной ${compareBranch} нет, но есть origin – чекаутим"
+            git(repoDir, "checkout -B \"${compareBranch}\" \"origin/${compareBranch}\"")
+        } else {
+            echo "[cherryPickTasksFrom1CRepo] Ветка ${compareBranch} не найдена ни локально, ни в origin – создаю от ${baseBranch}"
+            git(repoDir, "checkout -B \"${compareBranch}\" \"${baseBranch}\"")
+            git(repoDir, "push -u origin \"${compareBranch}\"")
+        }
+    }
+
+    // Список коммитов, которых нет в compareBranch
+    git(repoDir, "checkout \"${baseBranch}\"")
+    git(repoDir, "log --reverse ${compareBranch}..${baseBranch} --pretty=format:\"%%h;%%s\" > .git\\commit_list.txt")
+    def listContent = readFile(file: "${repoDir}\\.git\\commit_list.txt", encoding: 'UTF-8')
+    cmd("cd /D \"${repoDir}\" & del /Q .git\\commit_list.txt 2>nul")
 
     if (!listContent?.trim()) {
-        echo "Нет новых коммитов для обработки"
+        echo "[cherryPickTasksFrom1CRepo] Новых коммитов между ${compareBranch} и ${baseBranch} нет"
+        env.GITSYNC_NO_NEW_COMMITS = "true"
+        env.GITSYNC_UPDATED_BRANCHES = ""
         return 0
     }
 
-    for (def line : listContent.readLines().findAll { it?.trim() }) {
+    // Парсим: каждый коммит → все #TASK-123 из сабжекта
+    def entries = []
+    listContent.readLines().each { line ->
+        line = line.trim()
+        if (!line) return
+
         def parts = line.split(";", 2)
-        if (parts.size() < 2) continue
-        def commit = parts[0].trim()
-        def message = parts[1].trim()
-        def issueKey = extractIssueKey(message)
-        if (!issueKey) continue
+        if (parts.length < 2) return
 
-        def featureBranch = "feature/${issueKey}"
-        echo "Обработка ${featureBranch} / ${commit}"
+        def shortHash = parts[0].trim()
+        def subject   = parts[1].trim()
 
-        def rc = git(repoDir, "checkout -B \"${featureBranch}\" \"origin/${featureBranch}\"")
-        if (rc != 0) {
-            git(repoDir, "checkout -B \"${featureBranch}\"")
-        }
-
-        rc = git(repoDir, "cherry-pick ${commit} --keep-redundant-commits")
-
-        if (rc != 0) {
-            echo "Возник конфликт при cherry-pick коммита ${commit}. Анализируем..."
-            git(repoDir, "diff --name-only --diff-filter=U > .git\\conflicts.txt")
-            def conflictsContent = readFile(file: "${repoDir}\\.git\\conflicts.txt", encoding: 'UTF-8')
-            def conflictFiles = conflictsContent.readLines().collect { it.trim().replace('/', '\\') }
-            cmd("cd /D \"${repoDir}\" & del /Q .git\\conflicts.txt 2>nul")
-            
-            def knownServiceFiles = ["src\\cf\\VERSION", "src\\cf\\dumplist.txt"]
-            def isOnlyServiceFilesConflict = !conflictFiles.isEmpty() && conflictFiles.every { knownServiceFiles.contains(it) }
-
-            if (isOnlyServiceFilesConflict) {
-                echo "Конфликт только в служебных файлах. Разрешаем автоматически."
-                git(repoDir, "checkout ${commit} -- src/cf/VERSION src/cf/dumplist.txt")
-                git(repoDir, "add .")
-                rc = git(repoDir, "cherry-pick --continue")
-                if (rc != 0) {
-                    echo "Не удалось продолжить cherry-pick. Отменяем."
-                    git(repoDir, "cherry-pick --abort")
-                    continue
-                }
-            } else {
-                echo "Обнаружен серьезный конфликт в коде. Отмена cherry-pick для ${commit}."
-                git(repoDir, "cherry-pick --abort")
-                continue
+        def matcher = (subject =~ /#([A-Z]+-\d+)/)
+        matcher.each { m ->
+            def issueKey = m[1]
+            if (issueKey) {
+                entries << [commit: shortHash, issueKey: issueKey]
             }
         }
-        
-        git(repoDir, "push --set-upstream origin \"${featureBranch}\"")
     }
-    
+
+    if (!entries) {
+        echo "[cherryPickTasksFrom1CRepo] В новых коммитах не найдено ни одного номера задачи вида #XXX-123"
+        env.GITSYNC_NO_NEW_COMMITS = "true"
+        env.GITSYNC_UPDATED_BRANCHES = ""
+        return 0
+    }
+
+    def updatedBranches = [] as Set
+
+    for (def entry in entries) {
+        def commit       = entry.commit
+        def issueKey     = entry.issueKey
+        def featureBranch = "feature/${issueKey}"
+
+        echo "----------------------------------------------"
+        echo "Обработка ${featureBranch} / ${commit}"
+
+        // Перед обработкой КАЖДОЙ задачи выметаем все локальные хвосты,
+        // чтобы checkout другой ветки не орал про local changes.
+        git(repoDir, "reset --hard")
+        git(repoDir, "clean -fdx")
+
+        def hasLocalFeature  = (git(repoDir, "show-ref --verify --quiet refs/heads/${featureBranch}") == 0)
+        def hasRemoteFeature = (git(repoDir, "show-ref --verify --quiet refs/remotes/origin/${featureBranch}") == 0)
+
+        if (!hasLocalFeature && !hasRemoteFeature) {
+            echo "- Ветка ${featureBranch} не найдена ни локально, ни в origin. Создаю от ${compareBranch}"
+            git(repoDir, "checkout -B \"${featureBranch}\" \"${compareBranch}\"")
+        } else if (!hasLocalFeature && hasRemoteFeature) {
+            echo "- Локальной ветки нет, но есть origin/${featureBranch}. Чекаутим её"
+            git(repoDir, "checkout -B \"${featureBranch}\" \"origin/${featureBranch}\"")
+        } else if (hasLocalFeature && !hasRemoteFeature) {
+            echo "- Ветка ${featureBranch} есть локально, а в origin нет. Использую локальную"
+            git(repoDir, "checkout \"${featureBranch}\"")
+        } else {
+            echo "- Ветка ${featureBranch} есть и локально, и в origin. Синхронизирую с origin"
+            git(repoDir, "checkout \"${featureBranch}\"")
+            git(repoDir, "reset --hard \"origin/${featureBranch}\"")
+        }
+
+        def isMerge = isMergeCommit(repoDir, commit)
+        def cherryPickCmd = isMerge
+                ? "cherry-pick --keep-redundant-commits -X theirs -m 1 ${commit}"
+                : "cherry-pick --keep-redundant-commits -X theirs ${commit}"
+
+        rc = git(repoDir, cherryPickCmd)
+
+        if (rc != 0) {
+            echo "Cherry-pick коммита ${commit} в ${featureBranch} вернул код ${rc}. Пытаюсь авторазрулить конфликты."
+
+            git(repoDir, "diff --name-only --diff-filter=U > .git\\conflicts.txt")
+            def conflicts = readFile(file: "${repoDir}\\.git\\conflicts.txt", encoding: 'UTF-8').trim()
+            cmd("cd /D \"${repoDir}\" & del /Q .git\\conflicts.txt 2>nul")
+
+            if (conflicts) {
+                echo "Найдены конфликтующие файлы:\n${conflicts}"
+                // Берём вариант из целевой ветки (theirs) и доклеиваем
+                git(repoDir, "checkout --theirs .")
+                git(repoDir, "add .")
+                rc = git(repoDir, "cherry-pick --continue")
+            }
+
+            if (rc != 0) {
+                git(repoDir, "cherry-pick --abort || git reset --hard")
+                error "Не удалось автоматически разрешить конфликт cherry-pick коммита ${commit} в ветке ${featureBranch}. Код ${rc}"
+            }
+        }
+
+        rc = git(repoDir, "push origin \"${featureBranch}\"")
+        if (rc != 0) {
+            error "Не удалось запушить ветку ${featureBranch} в origin (код ${rc})"
+        }
+
+        updatedBranches << featureBranch
+    }
+
     git(repoDir, "checkout \"${baseBranch}\"")
+
+    env.GITSYNC_NO_NEW_COMMITS   = "false"
+    env.GITSYNC_UPDATED_BRANCHES = updatedBranches.join(' ')
+
+    echo "[cherryPickTasksFrom1CRepo] Обновлены ветки: ${env.GITSYNC_UPDATED_BRANCHES}"
+    echo "----------------------------------------------"
+
     return 0
 }
+
 
 /**
  * Финальная синхронизация. Обновляет служебную ветку branch_sync_1c_repo,
  * чтобы отметить коммиты как обработанные и не обрабатывать их в следующий раз.
- * @param repoDir Путь к локальному Git-репозиторию.
- * @return 0 при успехе.
  */
 def updateBranchSyncFrom1CRepo(String repoDir, String remoteHttps, String baseBranch = "1C_REPO", String compareBranch = "branch_sync_1c_repo") {
     if (!repoDir?.trim()) error "updateBranchSync: repoDir is empty"
     git(repoDir, "fetch --all --prune")
-    git(repoDir, "checkout -B \"${compareBranch}\" \"origin/${compareBranch}\"")
+
+    def hasLocalCompare  = (git(repoDir, "show-ref --verify --quiet refs/heads/${compareBranch}") == 0)
+    def hasRemoteCompare = (git(repoDir, "show-ref --verify --quiet refs/remotes/origin/${compareBranch}") == 0)
+
+    if (hasLocalCompare) {
+        git(repoDir, "checkout \"${compareBranch}\"")
+    } else if (hasRemoteCompare) {
+        git(repoDir, "checkout -B \"${compareBranch}\" \"origin/${compareBranch}\"")
+    } else {
+        echo "Ветка ${compareBranch} не найдена ни локально, ни в origin. Создаю её от ${baseBranch}."
+        git(repoDir, "checkout -B \"${compareBranch}\" \"${baseBranch}\"")
+    }
+
     git(repoDir, "reset --hard")
     git(repoDir, "merge \"${baseBranch}\" --no-edit")
     git(repoDir, "push origin \"${compareBranch}\"")
