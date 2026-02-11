@@ -16,7 +16,7 @@ import io.libs.v8_utils
 def utils = new v8_utils()
 
 pipeline {
-    agent { label 'localhost' }
+    agent { label 'OPL-DC01-1CPPD' }
 
     options {
         timestamps()
@@ -39,71 +39,6 @@ pipeline {
     }
 
     stages {
-        // -----------------------------------------------------------------
-        // Уведомление
-        // -----------------------------------------------------------------
-        stage('Notify Start') {
-            steps {
-                script {
-                    utils.telegram_send_message(
-                        env.TELEGRAM_CHAT_TOKEN,
-                        env.TELEGRAM_CHAT_ID,
-                       "🚀 Запущено обновление PRE-PROD (${params.IB_PREPROD})\nВетка: ${params.GIT_BRANCH}\nJob: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                        true
-                    )
-                }
-           }
-        }
-
-        // -----------------------------------------------------------------
-        // 1. Сборка CF из Git (develop)
-        // -----------------------------------------------------------------
-        stage('Checkout & Build CF') {
-            steps {
-                script {
-                    cleanWs()
-                
-                    echo "Checkout ветки ${params.GIT_BRANCH}..."
-                    withCredentials([usernamePassword(
-                        credentialsId: 'token',
-                        usernameVariable: 'GIT_USER',
-                        passwordVariable: 'GIT_TOKEN'
-                    )]) {
-                        def remoteUrl = "https://${GIT_USER}:${GIT_TOKEN}@${env.rep_git_remote}"
-                        utils.cmd("git clone --branch ${params.GIT_BRANCH} --single-branch ${remoteUrl} .", env.WORKSPACE)
-                    }
-                
-                    echo "Сборка конфигурации..."
-                    utils.compileCF_to_file_safe(env.SRC_CF_PATH, env.OUTPUT_CF_FILE)
-                }
-            }
-        }
-
-        // -----------------------------------------------------------------
-        // 2. Бэкап Production базы
-        // -----------------------------------------------------------------
-        stage('Backup Production DB') {
-            steps {
-                script {
-                    echo "Создание бэкапа базы ${params.DB_PROD} на сервере ${params.SQL_PROD_SERVER}..."
-                    echo "Путь: ${env.FULL_BACKUP_PATH}"
-
-                    withCredentials([usernamePassword(
-                        credentialsId: params.SQL_PROD_CRED,
-                        usernameVariable: 'SQL_USER',
-                        passwordVariable: 'SQL_PASS'
-                    )]) {
-                        utils.mssqlBackupToFile(
-                            params.SQL_PROD_SERVER,
-                            params.DB_PROD,
-                            env.FULL_BACKUP_PATH,
-                            SQL_USER,
-                            SQL_PASS
-                        )
-                    }
-                }
-            }
-        }
 
         // -----------------------------------------------------------------
         // 3. Восстановление в Pre-Production
@@ -111,38 +46,17 @@ pipeline {
         stage('Restore to Pre-Prod') {
             steps {
                 script {
-                    echo "Восстановление базы ${params.DB_PREPROD} на сервере ${params.SQL_PREPROD_SERVER}..."
-                    echo "Источник: ${env.FULL_BACKUP_PATH}"
-
-                    // Перед восстановлением можно (и нужно) завершить сеансы 1С, если сервер запущен
-                    // Но при restore with replace и kill connections sql сервер сам порвет соединения.
-                    // Однако кластер 1С может "удивиться". 
-                    // Хорошей практикой было бы заблокировать сеансы 1С на Pre-Prod, но это опционально,
-                    // так как база все равно будет перезаписана на уровне SQL.
-                    // Для надежности заблокируем, чтобы никто не сидел.
+                    
                     
                     try {
                          withCredentials([usernamePassword(credentialsId: params.RAC_CRED, usernameVariable: 'RAC_USER', passwordVariable: 'RAC_PASS')]) {
                             // Игнорируем ошибки блокировки, т.к. база может быть "битой" или выключенной, главное попытаться
-                            utils.lockSessions(params.SERVER_1C_PREPROD, params.IB_PREPROD, RAC_USER, RAC_PASS, "ОбновлениеКонфигурации")
+                            utils.lockSessions(params.SERVER_1C_PREPROD, params.IB_PREPROD, RAC_USER, RAC_PASS, "Обновление конфигурации")
                         }
                     } catch (e) {
                         echo "⚠️ Не удалось заблокировать сеансы 1С (возможно, база недоступна). Продолжаем восстановление SQL."
                     }
 
-                    withCredentials([usernamePassword(
-                        credentialsId: params.SQL_PREPROD_CRED,
-                        usernameVariable: 'SQL_USER',
-                        passwordVariable: 'SQL_PASS'
-                    )]) {
-                        utils.mssqlRestore(
-                            params.SQL_PREPROD_SERVER,
-                            params.DB_PREPROD,
-                            env.FULL_BACKUP_PATH,
-                            SQL_USER,
-                            SQL_PASS
-                        )
-                    }
                 }
             }
         }
@@ -167,8 +81,8 @@ pipeline {
                         credentialsId: params.SQL_PREPROD_CRED,
                         usernameVariable: 'SQL_USER',
                         passwordVariable: 'SQL_PASS'
-                    ),]) {
-                        utils.updateDB_preprod_vrunner_resilient_after_restore(
+                    )]) {
+                        utils.updateDB_via_ibcmd_or_vrunner(
                             env.OUTPUT_CF_FILE,
                             params.SERVER_1C_PREPROD,
                             params.SQL_PREPROD_SERVER,
@@ -213,32 +127,39 @@ pipeline {
                     utils.unlockSessions(params.SERVER_1C_PREPROD, params.IB_PREPROD, RAC_USER, RAC_PASS)
                 }
                 
-                // Очистка бэкапа (чтобы не забивать место)
+                // Очистка бэкапа (опционально, чтобы не забивать место)
+                // Если нужно хранить - закомментируйте
+                /*
                 def backupFile = env.FULL_BACKUP_PATH
                 if (fileExists(backupFile)) {
+                   // fileExists работает локально на агенте. 
+                   // Если путь сетевой и агент его видит как локальный путь (mount) - сработает.
+                   // Если это UNC путь, jenkins может не уметь его удалять через file operations.
+                   // Можно попробовать через bat del
                    bat "del /Q \"${backupFile}\""
                 }
+                */
             }
         }
-        success {
-            script {
-                utils.telegram_send_message(
-                    env.TELEGRAM_CHAT_TOKEN,
-                    env.TELEGRAM_CHAT_ID,
-                    "✅ Обновление PRE-PROD успешно завершено!",
-                    true
-                )
-            }
-        }
-        failure {
-            script {
-                utils.telegram_send_message(
-                    env.TELEGRAM_CHAT_TOKEN,
-                    env.TELEGRAM_CHAT_ID,
-                    "❌ Ошибка обновления PRE-PROD",
-                    false
-                )
-            }
-        }
+        //success {
+            //script {
+                //utils.telegram_send_message(
+                //    env.TELEGRAM_CHAT_TOKEN,
+                //    env.TELEGRAM_CHAT_ID,
+                //    "✅ Обновление PRE-PROD успешно завершено!",
+                //    true
+                //)
+            //}
+        //}
+        //failure {
+        //    script {
+                //utils.telegram_send_message(
+                //    env.TELEGRAM_CHAT_TOKEN,
+                //    env.TELEGRAM_CHAT_ID,
+                //    "❌ Ошибка обновления PRE-PROD",
+                //    false
+                //)
+        //    }
+        //}
     }
 }

@@ -248,6 +248,117 @@ def updateExtension_via_ibcmd_or_vrunner(String cfePath, String extName,
     return 0
 }
 
+/**
+ * Устойчивое обновление PRE-PROD после RESTORE:
+ * - ждём готовность SQL
+ * - (опционально) повторно добиваем сессии
+ * - vrunner load с ретраями, потому что после RESTORE кластер 1С иногда
+ *   прибивает управляемый сеанс (в логах: «Сеанс работы завершен администратором»)
+ *
+ * Важно: здесь оставляем именно vrunner load (как ты хочешь), чтобы поддержка конфы
+ * не ломалась нестандартным способом.
+ */
+def updateDB_preprod_vrunner_resilient_after_restore(String cfFile,
+                                                     String server1c,
+                                                     String serverSQL,
+                                                     String dbName,
+                                                     String sqlUser,
+                                                     String sqlPass,
+                                                     String v8version = '8.3.27.1859',
+                                                     int attempts = 3,
+                                                     int warmupWaitSec = 30) {
+
+    if (!fileExists(cfFile)) {
+        error "Файл конфигурации не найден: ${cfFile}"
+    }
+
+    echo "=== PRE-PROD: обновление конфигурации '${dbName}' через vrunner load (устойчивый режим) ==="
+
+    // 1) Ждём SQL после restore
+    waitSqlReady(serverSQL, dbName, sqlUser, sqlPass, 60, 5)
+
+    // 2) Небольшой прогрев (после RESTORE иногда ещё дергаются фоновые/служебные вещи)
+    echo "⏳ Прогрев после RESTORE: ${warmupWaitSec}s"
+    sleep time: warmupWaitSec, unit: 'SECONDS'
+
+    // 3) Несколько попыток vrunner load
+    for (int i = 1; i <= attempts; i++) {
+        echo "🔁 Попытка ${i}/${attempts}: добиваем сессии и грузим CF..."
+
+        // на всякий: ещё раз блок+kill, чтобы никто не мешал
+        def rcLock = bat(
+            returnStatus: true,
+            script: """
+                @echo off
+                chcp 65001 >nul
+                vrunner session lock --ras "${server1c}" --db "${dbName}" ^
+                  --cluster-admin "${sqlUser}" --cluster-pwd "${sqlPass}" ^
+                  --db-user "${sqlUser}" --db-pwd "${sqlPass}" ^
+                  --uccode "ОбновлениеКонфигурации"
+                exit /b %ERRORLEVEL%
+            """
+        )
+        echo "DEBUG: session lock rc=${rcLock} (для PRE-PROD не критично, если уже заблокировано)"
+
+        def rcKill = bat(
+            returnStatus: true,
+            script: """
+                @echo off
+                chcp 65001 >nul
+                vrunner session kill --ras "${server1c}" --db "${dbName}" ^
+                  --cluster-admin "${sqlUser}" --cluster-pwd "${sqlPass}" ^
+                  --db-user "${sqlUser}" --db-pwd "${sqlPass}" ^
+                  --uccode "ОбновлениеКонфигурации"
+                exit /b %ERRORLEVEL%
+            """
+        )
+        echo "DEBUG: session kill rc=${rcKill} (для PRE-PROD не критично)"
+
+        // контрольная пауза
+        sleep time: 10, unit: 'SECONDS'
+
+        // vrunner load 
+        def rcLoad = bat(
+            returnStatus: true,
+            script: """
+                @echo off
+                chcp 65001 >nul
+                setlocal enableextensions
+
+                if exist "C:\\Program Files\\1cv8\\${v8version}\\bin" (
+                    set "PATH=C:\\Program Files\\1cv8\\${v8version}\\bin;%PATH%"
+                )
+
+                echo [VRUNNER LOAD] %DATE% %TIME%
+                vrunner load ^
+                  --src "${cfFile}" ^
+                  --v8version "${v8version}" ^
+                  --ibconnection "/S${server1c}\\${dbName}" ^
+                  --db-user "${sqlUser}" --db-pwd "${sqlPass}" ^
+                  --uccode "ОбновлениеКонфигурации"
+
+                exit /b %ERRORLEVEL%
+            """
+        )
+
+        if (rcLoad == 0) {
+            echo "✅ PRE-PROD: загрузка CF завершена успешно."
+            return 0
+        }
+
+        echo "⚠ PRE-PROD: vrunner load упал (rc=${rcLoad})."
+
+        // если это не последняя попытка, ждём и пробуем ещё раз
+        if (i < attempts) {
+            int backoff = 20 * i
+            echo "⏳ Подождём ${backoff}s и повторим (после RESTORE кластер бывает в ступоре)."
+            sleep time: backoff, unit: 'SECONDS'
+        }
+    }
+
+    error "PRE-PROD: не удалось загрузить CF через vrunner после ${attempts} попыток."
+}
+
 /** ---------------------- TELEGRAM --------------------- */
 
 /** Уведомление в Telegram */
@@ -403,6 +514,42 @@ def mssqlBackup(String server, String dbName, String backupDir, String sqlUser, 
     return rc
 }
 
+/**
+ * Ждём, пока SQL база начнёт отвечать после RESTORE/переключений.
+ * Пытаемся выполнить простой SELECT 1 в контексте нужной базы.
+ */
+def waitSqlReady(String serverSQL,
+                 String dbName,
+                 String sqlUser,
+                 String sqlPass,
+                 int attempts = 60,
+                 int sleepSec = 5) {
+
+    echo "⏳ Ожидание доступности SQL базы '${dbName}' на '${serverSQL}' (attempts=${attempts}, sleep=${sleepSec}s)..."
+
+    for (int i = 1; i <= attempts; i++) {
+        def rc = bat(
+            returnStatus: true,
+            script: """
+                @echo off
+                chcp 65001 >nul
+                sqlcmd -S "${serverSQL}" -U "${sqlUser}" -P "${sqlPass}" -d "${dbName}" -b -Q "SET NOCOUNT ON; SELECT 1;"
+                exit /b %ERRORLEVEL%
+            """
+        )
+
+        if (rc == 0) {
+            echo "✅ SQL база '${dbName}' отвечает."
+            return 0
+        }
+
+        echo "…попытка ${i}/${attempts} неудачна (rc=${rc}). Ждём ${sleepSec}s."
+        sleep time: sleepSec, unit: 'SECONDS'
+    }
+
+    error "SQL база '${dbName}' не стала доступной за ${attempts * sleepSec} секунд."
+}
+
 /** -----------------------------------------------------------
  *  УПРАВЛЕНИЕ СЕАНСАМИ ПОЛЬЗОВАТЕЛЕЙ 1С
  * ----------------------------------------------------------- */
@@ -539,7 +686,7 @@ def cherryPickTasksFrom1CRepo(String repoDir, String remoteHttps, String baseBra
         def shortHash = parts[0].trim()
         def subject   = parts[1].trim()
 
-        def matcher = (subject =~ /#([A-Z]+-\d+)/)
+        def matcher = (subject =~ /(?i)#?([A-Z][A-Z0-9_]*-\d+)/)
         matcher.each { m ->
             def issueKey = m[1]
             if (issueKey) {
