@@ -343,6 +343,31 @@ def updateDB_preprod_vrunner_resilient_after_restore(String cfFile,
 
         if (rcLoad == 0) {
             echo "✅ PRE-PROD: загрузка CF завершена успешно."
+
+            // 2) Применение конфигурации через ibcmd
+            def rcApply = bat(
+                returnStatus: true,
+                script: """
+                    @echo off
+                    chcp 65001 >nul
+                    setlocal enableextensions
+
+                    echo [2/2] Применение конфигурации ibcmd: %DATE% %TIME%
+                    ibcmd infobase config apply ^
+                    --dbms MSSQLServer ^
+                    --db-server="${serverSQL}" ^
+                    --db-name="${dbName}" ^
+                    --db-user="${sqlUser}" --db-pwd="${sqlPass}" ^
+                    --user="${sqlUser}" --password="${sqlPass}" ^
+                    --force
+
+                    exit /b %ERRORLEVEL%
+                """
+            )
+
+            if (rcApply != 0) {
+                error "Ошибка при применении конфигурации через ibcmd (код ${rcApply})"
+            }
             return 0
         }
 
@@ -399,30 +424,40 @@ def telegram_send_message(TOKEN, CHAT_ID, messageText, success) {
         messageText = messageText + "\n" + details.join("\n")
     }
 
-    // Путь к файлу сообщения в текущем workspace
-    def ws = pwd()
-    def msgFile = "${ws}/tmp_telegram_message.txt"
+    telegram_send_safe(TOKEN, CHAT_ID, messageText, true)
+}
 
-    // Пишем основной текст в файл
-    writeFile file: msgFile, text: messageText, encoding: 'UTF-8'
+/** 
+ * Безопасная отправка в Telegram 
+ * (НЕ валит pipeline при сетевых проблемах, использует ретраи)
+ */
+def telegram_send_safe(String token, String chatId, String text, boolean disablePreview = true) {
+    try {
+        def ws = pwd()
+        def msgFile = "${ws}\\tmp_telegram_message.txt"
+        
+        // Пишем текст в файл, чтобы корректно передать переносы строк
+        writeFile file: msgFile, text: text, encoding: "UTF-8"
 
-    // Базовая часть curl-команды
-    def curlBase = "curl -X POST https://api.telegram.org/bot${TOKEN}/sendMessage -d chat_id=${CHAT_ID}"
+        // returnStatus:true — не бросает exception, а возвращает код
+        int rc = bat(
+            returnStatus: true,
+            script: """
+                chcp 65001 1>nul
+                curl --http1.1 --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 10 --max-time 90 ^
+                  -X POST "https://api.telegram.org/bot${token}/sendMessage" ^
+                  -d chat_id="${chatId}" ^
+                  -d disable_web_page_preview=${disablePreview ? "true" : "false"} ^
+                  --data-urlencode text@"${msgFile}"
+            """.stripIndent()
+        )
 
-    def command
-
-    if (fileExists(msgFile)) {
-        // Нормальный сценарий: шлём содержимое файла
-        command = "chcp 65001 > nul & ${curlBase} --data-urlencode text@\"${msgFile}\""
-    } else {
-        // Файл не создался/куда-то делся – шлём запасную строку
-        def fallbackText = "Build success, not file in folder"
-        command = "chcp 65001 > nul & ${curlBase} --data-urlencode \"text=${fallbackText}\""
+        if (rc != 0) {
+            echo "⚠️ Telegram notify failed (exit code ${rc}). Продолжаем выполнение пайплайна."
+        }
+    } catch (Throwable e) {
+        echo "⚠️ Telegram notify threw exception: ${e}. Продолжаем выполнение пайплайна."
     }
-
-    // Логируем ответ от Telegram
-    def out = bat(script: command, returnStdout: true).trim()
-    echo "telegram_send_message response: ${out}"
 }
 
 
@@ -784,6 +819,31 @@ def cherryPickTasksFrom1CRepo(String repoDir, String remoteHttps, String baseBra
 
 
 /**
+ * Скачивает ветку репозитория, подготавливает директории и подтягивает теги.
+ * Эта функция заменяет шаги клонирования и fetch в пайплайнах генерации задач.
+ *
+ * @param branchName Имя ветки для чекаута
+ * @param remoteUrl Репозиторий (без кредов, передается через окружение)
+ * @param workspaceDir Рабочая директория (обычно env.WORKSPACE)
+ * @param stateDir Директория для хранения стейт-файлов, которая будет создана при отсутствии
+ * @param gitUser Пользователь Git
+ * @param gitToken Токен или пароль Git
+ */
+def checkoutBranchAndFetchTags(String branchName, String remoteUrl, String workspaceDir, String stateDir, String gitUser, String gitToken) {
+    echo "Checkout ветки ${branchName}..."
+    def fullRemoteUrl = "https://${gitUser}:${gitToken}@${remoteUrl}"
+    cmd("git clone --branch ${branchName} --single-branch ${fullRemoteUrl} .", workspaceDir)
+
+    echo "Создание директории для стейтов (если не существует): ${stateDir}"
+    ensureDirs(stateDir)
+
+    echo "Обновление тегов (git fetch --tags --force)..."
+    def rc = cmd("git fetch --tags --force", workspaceDir)
+    if (rc != 0) {
+        error "Ошибка при получении тегов из репозитория (код ${rc})"
+    }
+}
+/**
  * Финальная синхронизация. Обновляет служебную ветку branch_sync_1c_repo,
  * чтобы отметить коммиты как обработанные и не обрабатывать их в следующий раз.
  */
@@ -808,4 +868,282 @@ def updateBranchSyncFrom1CRepo(String repoDir, String remoteHttps, String baseBr
     git(repoDir, "push origin \"${compareBranch}\"")
     git(repoDir, "checkout \"${baseBranch}\"")
     return 0
+}
+
+/**
+ * Выполняет обработку удаления fix-расширений
+ */
+def deleteFixExtensions(String epfPath, String v8version, String server1c, String dbName, String dbUser, String dbPass, String uccode = "ОбновлениеКонфигурации") {
+    echo "=== Удаление fix-расширений: ${epfPath} ==="
+    
+    def rc = bat(
+        returnStatus: true,
+        script: """
+            @echo off
+            chcp 65001 >nul
+            setlocal enableextensions
+            vrunner run --execute "${epfPath}" --v8version "${v8version}" --ibconnection "/S${server1c}\\${dbName}" --db-user "${dbUser}" --db-pwd "${dbPass}" --uccode "${uccode}" --command "/DisableStartupMessages /DisableStartupDialogs" > delete_fix_ext.log 2>&1
+            set VRUNNER_RC=%ERRORLEVEL%
+            type delete_fix_ext.log
+            exit /b %VRUNNER_RC%
+        """.stripIndent()
+    )
+
+    def logContent = ""
+    if (fileExists("delete_fix_ext.log")) {
+        logContent = readFile(file: "delete_fix_ext.log", encoding: "UTF-8")
+    }
+
+    boolean hasError = false
+    def lines = logContent.readLines()
+    for (String line : lines) {
+        String trimmed = line.trim()
+        if (trimmed.startsWith("{") && trimmed.contains("}: ") && trimmed.contains("(")) {
+            hasError = true
+            echo "❌ Найдена ошибка компиляции/выполнения: ${trimmed}"
+        } else if (trimmed.contains("Критическая ошибка") || trimmed.contains("Невосстановимая ошибка")) {
+            hasError = true
+            echo "❌ Найдена критическая ошибка: ${trimmed}"
+        }
+    }
+
+    if (rc != 0 || hasError) {
+        error "Ошибка удаления fix-расширений через vrunner (код ${rc}, найдены ошибки в логе)"
+    }
+    
+    echo "✅ Удаление fix-расширений завершено."
+    return rc
+}
+
+/**
+ * Проверка работоспособности базы после обновления
+ */
+def checkDbHealth(String epfPath, String v8version, String server1c, String dbName, String dbUser, String dbPass, String uccode = "ОбновлениеКонфигурации") {
+    echo "=== Проверка работоспособности базы: ${epfPath} ==="
+    
+    def rc = bat(
+        returnStatus: true,
+        script: """
+            @echo off
+            chcp 65001 >nul
+            setlocal enableextensions
+            vrunner run --execute "${epfPath}" --v8version "${v8version}" --ibconnection "/S${server1c}\\${dbName}" --db-user "${dbUser}" --db-pwd "${dbPass}" --uccode "${uccode}" --command "/DisableStartupMessages /DisableStartupDialogs" > check_db_health.log 2>&1
+            set VRUNNER_RC=%ERRORLEVEL%
+            type check_db_health.log
+            exit /b %VRUNNER_RC%
+        """.stripIndent()
+    )
+
+    def logContent = ""
+    if (fileExists("check_db_health.log")) {
+        logContent = readFile(file: "check_db_health.log", encoding: "UTF-8")
+    }
+
+    boolean hasError = false
+    String errorMessage = ""
+    def lines = logContent.readLines()
+    for (String line : lines) {
+        String trimmed = line.trim()
+        if (trimmed.startsWith("{") && trimmed.contains("}: ") && trimmed.contains("(")) {
+            hasError = true
+            errorMessage = trimmed
+            echo "❌ Найдена ошибка компиляции/выполнения: ${trimmed}"
+            break
+        } else if (trimmed.contains("Критическая ошибка") || trimmed.contains("Невосстановимая ошибка")) {
+            hasError = true
+            errorMessage = trimmed
+            echo "❌ Найдена критическая ошибка: ${trimmed}"
+            break
+        }
+    }
+
+    if (rc != 0 || hasError) {
+        // Сохраняем текст ошибки в файл, чтобы 100% прочитать его в пайплайне
+        if (errorMessage) {
+            writeFile(file: "db_health_error.txt", text: errorMessage, encoding: "UTF-8")
+        }
+        error "Ошибка при проверке работоспособности базы (код ${rc}, найдены ошибки в логе)"
+    }
+    
+    echo "✅ Проверка базы успешно завершена."
+    return rc
+}
+
+/**
+ * Формирует список задач релиза на основе коммитов с предыдущего тега до текущего.
+ * @param lastReleaseTagFile Путь к файлу с предыдущим релизным тегом
+ * @param lastReleaseTasksFile Путь к выходному файлу со списком задач
+ */
+def generateReleaseTasksFile(String lastReleaseTagFile, String lastReleaseTasksFile) {
+    String lastTag = ''
+    if (fileExists(lastReleaseTagFile)) {
+        lastTag = readFile(
+            file: lastReleaseTagFile,
+            encoding: 'UTF-8'
+        ).trim()
+    }
+
+    echo "Предыдущий релизный тег: ${lastTag ?: '(не найден)'}"
+
+    String psGetCurrentTag = '''
+$ErrorActionPreference = 'Stop'
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+$tags = @(git tag --sort=-creatordate)
+if ($LASTEXITCODE -ne 0) {
+    throw "Ошибка выполнения команды git tag --sort=-creatordate"
+}
+
+if ($tags.Count -eq 0) {
+    throw "Не удалось определить текущий тег. В репозитории нет тегов."
+}
+
+$tag = "$($tags[0])".Trim()
+if ([string]::IsNullOrWhiteSpace($tag)) {
+    throw "Текущий тег пустой"
+}
+
+[System.IO.File]::WriteAllText("current_tag.txt", $tag, $utf8NoBom)
+'''
+
+    writeFile(
+        file: 'get_current_tag.ps1',
+        text: psGetCurrentTag,
+        encoding: 'UTF-8'
+    )
+
+    bat '''
+@echo off
+chcp 65001 > nul
+powershell -NoProfile -ExecutionPolicy Bypass -File get_current_tag.ps1
+if errorlevel 1 exit /b 1
+'''
+
+    if (!fileExists('current_tag.txt')) {
+        error 'Файл current_tag.txt не был создан'
+    }
+
+    String currentTag = readFile(
+        file: 'current_tag.txt',
+        encoding: 'UTF-8'
+    ).trim()
+
+    if (!currentTag) {
+        error 'Не удалось определить текущий тег'
+    }
+
+    echo "Текущий тег: ${currentTag}"
+
+    String gitRange
+    if (lastTag) {
+        int verifyRc = bat(
+            script: """@echo off
+git rev-parse --verify "refs/tags/${lastTag}" >nul 2>nul
+""",
+            returnStatus: true
+        )
+
+        if (verifyRc == 0) {
+            gitRange = "${lastTag}..${currentTag}"
+        } else {
+            echo "Предыдущий тег ${lastTag} не найден в репозитории. Будет использован диапазон до текущего тега."
+            gitRange = currentTag
+        }
+    } else {
+        gitRange = currentTag
+    }
+
+    echo "Диапазон коммитов: ${gitRange}"
+
+    String psScript = '''
+$ErrorActionPreference = 'Stop'
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+$range = $env:GIT_RANGE
+if ([string]::IsNullOrWhiteSpace($range)) {
+    throw "Переменная GIT_RANGE пустая"
+}
+
+$logLines = @(git log "$range" --pretty=format:%s)
+if ($LASTEXITCODE -ne 0) {
+    throw "Ошибка выполнения git log для диапазона: $range"
+}
+
+$seen = @{}
+$result = New-Object System.Collections.Generic.List[string]
+
+foreach ($line in $logLines) {
+    if ([string]::IsNullOrWhiteSpace($line)) {
+        continue
+    }
+
+    $text = $line.Trim()
+
+    $matchesFound = [regex]::Matches($text, '(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_]*-\\d+)')
+    foreach ($m in $matchesFound) {
+        $taskKey = $m.Groups[1].Value.ToUpper()
+
+        if (-not $seen.ContainsKey($taskKey)) {
+            $seen[$taskKey] = $true
+            [void]$result.Add($taskKey)
+        }
+    }
+}
+
+$content = ""
+if ($result.Count -gt 0) {
+    $content = ($result -join [Environment]::NewLine) + [Environment]::NewLine
+}
+
+[System.IO.File]::WriteAllText("tasks_unique.txt", $content, $utf8NoBom)
+'''
+
+    writeFile(
+        file: 'gen_tasks.ps1',
+        text: psScript,
+        encoding: 'UTF-8'
+    )
+
+    withEnv(["GIT_RANGE=${gitRange}"]) {
+        bat '''
+@echo off
+chcp 65001 > nul
+powershell -NoProfile -ExecutionPolicy Bypass -File gen_tasks.ps1
+if errorlevel 1 exit /b 1
+'''
+    }
+
+    List<String> taskKeys = []
+    if (fileExists('tasks_unique.txt')) {
+        taskKeys = readFile(
+            file: 'tasks_unique.txt',
+            encoding: 'UTF-8'
+        )
+        .readLines()
+        .collect { it.trim() }
+        .findAll { it }
+    }
+
+    String fileContent = ''
+    if (!taskKeys.isEmpty()) {
+        fileContent = taskKeys.join('\n') + '\n'
+    }
+
+    writeFile(
+        file: lastReleaseTasksFile,
+        text: fileContent,
+        encoding: 'UTF-8'
+    )
+
+    echo "Файл со списком задач сформирован: ${lastReleaseTasksFile}"
+    echo "Количество найденных задач: ${taskKeys.size()}"
+
+    if (taskKeys.isEmpty()) {
+        echo 'Задачи по коммитам не найдены, файл записан пустым.'
+    } else {
+        echo 'Найденные задачи:'
+        taskKeys.each { task ->
+            echo " - ${task}"
+        }
+    }
 }

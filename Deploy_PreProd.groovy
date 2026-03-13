@@ -26,21 +26,27 @@ pipeline {
 
     parameters {
         string(name: 'SHARED_BACKUP_PATH', defaultValue: '\\\\opl-dc01-sqlc3\\backup_base\\BACKUP\\ERP\\SHARED', description: 'Сетевой путь для бэкапа, доступный обоим SQL серверам')
+        string(name: 'FIX_DELETE_EPF', defaultValue: 'D:\\DevOps\\ERP\\MRS_УдалениеИсправлений.epf', description: 'Путь к внешней обработке удаления fix-расширений')
+        string(name: 'CHECK_DB_EPF', defaultValue: 'D:\\DevOps\\ERP\\MRS_ПроверкаБД.epf', description: 'Путь к внешней обработке проверки БД')
+        string(name: 'LAST_RELEASE_TASKS_FILE', defaultValue: 'D:\\DevOps\\deployment_state\\ERP\\last_release_tasks.txt', description: 'Файл со списком задач релиза')
     }
 
     environment {
         // Формируем имя файла бэкапа один раз, чтобы использовать везде
         BACKUP_FILENAME = "ERP_Prod_Transfer_${new Date().format('yyyyMMdd_HHmmss')}.bak"
         FULL_BACKUP_PATH = "${params.SHARED_BACKUP_PATH}\\${BACKUP_FILENAME}"
-        
+
         // Пути для сборки CF
         SRC_CF_PATH = "${WORKSPACE}\\src\\cf"
         OUTPUT_CF_FILE = "${WORKSPACE}\\build\\Configuration_develop.cf"
+        
+        // Переменная для хранения текста ошибки из 1С
+        DB_HEALTH_CHECK_ERROR = ""
     }
 
     stages {
         // -----------------------------------------------------------------
-        // Уведомление
+        // Уведомление (старт)
         // -----------------------------------------------------------------
         stage('Notify Start') {
             steps {
@@ -48,7 +54,9 @@ pipeline {
                     utils.telegram_send_message(
                         env.TELEGRAM_CHAT_TOKEN,
                         env.TELEGRAM_CHAT_ID,
-                       "🚀 Запущено обновление PRE-PROD (${params.IB_PREPROD})\nВетка: ${params.GIT_BRANCH}\nJob: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                        "🚀 Запущено обновление PRE-PROD (${params.IB_PREPROD})\n" +
+                        "Ветка: ${params.GIT_BRANCH}\n" +
+                        "Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
                         true
                     )
                 }
@@ -62,7 +70,7 @@ pipeline {
             steps {
                 script {
                     cleanWs()
-                
+
                     echo "Checkout ветки ${params.GIT_BRANCH}..."
                     withCredentials([usernamePassword(
                         credentialsId: 'token',
@@ -72,7 +80,7 @@ pipeline {
                         def remoteUrl = "https://${GIT_USER}:${GIT_TOKEN}@${env.rep_git_remote}"
                         utils.cmd("git clone --branch ${params.GIT_BRANCH} --single-branch ${remoteUrl} .", env.WORKSPACE)
                     }
-                
+
                     echo "Сборка конфигурации..."
                     utils.compileCF_to_file_safe(env.SRC_CF_PATH, env.OUTPUT_CF_FILE)
                 }
@@ -114,16 +122,10 @@ pipeline {
                     echo "Восстановление базы ${params.DB_PREPROD} на сервере ${params.SQL_PREPROD_SERVER}..."
                     echo "Источник: ${env.FULL_BACKUP_PATH}"
 
-                    // Перед восстановлением можно (и нужно) завершить сеансы 1С, если сервер запущен
-                    // Но при restore with replace и kill connections sql сервер сам порвет соединения.
-                    // Однако кластер 1С может "удивиться". 
-                    // Хорошей практикой было бы заблокировать сеансы 1С на Pre-Prod, но это опционально,
-                    // так как база все равно будет перезаписана на уровне SQL.
-                    // Для надежности заблокируем, чтобы никто не сидел.
-                    
+                    // Для надежности блокируем сеансы 1С перед restore
                     try {
-                         withCredentials([usernamePassword(credentialsId: params.RAC_CRED, usernameVariable: 'RAC_USER', passwordVariable: 'RAC_PASS')]) {
-                            // Игнорируем ошибки блокировки, т.к. база может быть "битой" или выключенной, главное попытаться
+                        withCredentials([usernamePassword(credentialsId: params.RAC_CRED, usernameVariable: 'RAC_USER', passwordVariable: 'RAC_PASS')]) {
+                            // Игнорируем ошибки блокировки — база может быть недоступна, важно попытаться
                             utils.lockSessions(params.SERVER_1C_PREPROD, params.IB_PREPROD, RAC_USER, RAC_PASS, "ОбновлениеКонфигурации")
                         }
                     } catch (e) {
@@ -148,6 +150,58 @@ pipeline {
         }
 
         // -----------------------------------------------------------------
+        // 3.5. Удаление Fix-расширений
+        // -----------------------------------------------------------------
+        stage('Delete Fix Extensions') {
+            steps {
+                script {
+                    if (!fileExists(params.LAST_RELEASE_TASKS_FILE)) {
+                        echo "Файл задач релиза не найден: ${params.LAST_RELEASE_TASKS_FILE}. Пропускаем удаление."
+                        return
+                    }
+
+                    def taskKeys = readFile(file: params.LAST_RELEASE_TASKS_FILE, encoding: 'UTF-8')
+                        .readLines()
+                        .collect { it.trim() }
+                        .findAll { it }
+
+                    if (taskKeys.isEmpty()) {
+                        echo "Файл задач пустой. Удаление fix-расширений пропускаем."
+                        return
+                    }
+
+                    if (!fileExists(params.FIX_DELETE_EPF)) {
+                        error "Не найдена внешняя обработка: ${params.FIX_DELETE_EPF}"
+                    }
+
+                    withCredentials([usernamePassword(
+                        credentialsId: params.SQL_PREPROD_CRED,
+                        usernameVariable: 'SQL_USER',
+                        passwordVariable: 'SQL_PASS'
+                    )]) {
+                        // Ждём, пока SQL база начнёт отвечать после RESTORE
+                        utils.waitSqlReady(params.SQL_PREPROD_SERVER, params.DB_PREPROD, SQL_USER, SQL_PASS, 60, 5)
+
+                        // Небольшой прогрев базы после RESTORE перед подключением 1С
+                        int warmupWaitSec = 30
+                        echo "⏳ Прогрев после RESTORE: ${warmupWaitSec}s"
+                        sleep time: warmupWaitSec, unit: 'SECONDS'
+
+                        utils.deleteFixExtensions(
+                            params.FIX_DELETE_EPF,
+                            params.v8version,
+                            params.SERVER_1C_PREPROD,
+                            params.DB_PREPROD,
+                            SQL_USER,
+                            SQL_PASS,
+                            "ОбновлениеКонфигурации"
+                        )
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
         // 4. Накатывание CF на Pre-Production
         // -----------------------------------------------------------------
         stage('Update Pre-Prod Config') {
@@ -155,19 +209,11 @@ pipeline {
                 script {
                     echo "Накатываем собранный CF на ${params.IB_PREPROD}..."
 
-                    // После восстановления базы из Prod, учетки SQL могут "поехать" (orphaned users),
-                    // если логины на серверах отличаются. 
-                    // Но мы используем SQL аутентификацию при обновлении.
-                    // Главное, чтобы пользователь, под которым мы обновляем, имел права db_owner в восстановленной базе.
-                    // Обычно пользователь 'sa' или системный админ имеет доступ везде.
-                    // Если используется специфический юзер, его, возможно, придется чинить (sp_change_users_login).
-                    // Будем считать, что права есть.
-
                     withCredentials([usernamePassword(
                         credentialsId: params.SQL_PREPROD_CRED,
                         usernameVariable: 'SQL_USER',
                         passwordVariable: 'SQL_PASS'
-                    ),]) {
+                    )]) {
                         utils.updateDB_preprod_vrunner_resilient_after_restore(
                             env.OUTPUT_CF_FILE,
                             params.SERVER_1C_PREPROD,
@@ -176,6 +222,35 @@ pipeline {
                             SQL_USER,
                             SQL_PASS
                         )
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // 4.5. Проверка работоспособности базы
+        // -----------------------------------------------------------------
+        stage('Check DB Health') {
+            steps {
+                script {
+                    if (!fileExists(params.CHECK_DB_EPF)) {
+                        echo "⚠️ Обработка проверки БД не найдена: ${params.CHECK_DB_EPF}. Пропускаем."
+                    } else {
+                        withCredentials([usernamePassword(
+                            credentialsId: params.SQL_PREPROD_CRED,
+                            usernameVariable: 'SQL_USER',
+                            passwordVariable: 'SQL_PASS'
+                        )]) {
+                            utils.checkDbHealth(
+                                params.CHECK_DB_EPF,
+                                params.v8version,
+                                params.SERVER_1C_PREPROD,
+                                params.DB_PREPROD,
+                                SQL_USER,
+                                SQL_PASS,
+                                "ОбновлениеКонфигурации"
+                            )
+                        }
                     }
                 }
             }
@@ -209,35 +284,34 @@ pipeline {
         always {
             script {
                 // Пытаемся разблокировать сеансы
-                 withCredentials([usernamePassword(credentialsId: params.RAC_CRED, usernameVariable: 'RAC_USER', passwordVariable: 'RAC_PASS')]) {
+                withCredentials([usernamePassword(credentialsId: params.RAC_CRED, usernameVariable: 'RAC_USER', passwordVariable: 'RAC_PASS')]) {
                     utils.unlockSessions(params.SERVER_1C_PREPROD, params.IB_PREPROD, RAC_USER, RAC_PASS)
                 }
-                
-                // Очистка бэкапа (чтобы не забивать место)
+
+                // Очистка бэкакапа (чтобы не забивать место)
                 def backupFile = env.FULL_BACKUP_PATH
                 if (fileExists(backupFile)) {
-                   bat "del /Q \"${backupFile}\""
+                    bat "del /Q \"${backupFile}\""
                 }
             }
         }
         success {
             script {
-                utils.telegram_send_message(
-                    env.TELEGRAM_CHAT_TOKEN,
-                    env.TELEGRAM_CHAT_ID,
-                    "✅ Обновление PRE-PROD успешно завершено!",
-                    true
-                )
+                utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, "Обновление PRE-PROD успешно завершено!", true)
             }
         }
         failure {
             script {
-                utils.telegram_send_message(
-                    env.TELEGRAM_CHAT_TOKEN,
-                    env.TELEGRAM_CHAT_ID,
-                    "❌ Ошибка обновления PRE-PROD",
-                    false
-                )
+                def failMessage = "Ошибка обновления PRE-PROD"
+                if (fileExists("db_health_error.txt")) {
+                    def errMsg = readFile(file: "db_health_error.txt", encoding: "UTF-8").trim()
+                    if (errMsg) {
+                        failMessage += "\n\n⚠️ **Ошибка при проверке базы (1С):**\n`" + errMsg + "`"
+                    }
+                } else if (env.DB_HEALTH_CHECK_ERROR) {
+                    failMessage += "\n\n⚠️ **Ошибка при проверке базы (1С):**\n`" + env.DB_HEALTH_CHECK_ERROR + "`"
+                }
+                utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, failMessage, false)
             }
         }
     }

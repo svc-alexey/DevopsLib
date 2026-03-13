@@ -13,6 +13,12 @@ pipeline {
         disableConcurrentBuilds()
     }
 
+    parameters {
+        string(name: 'FIX_DELETE_EPF', defaultValue: '${WORKSPACE}\\tools\\MRS_УдалениеИсправлений.epf', description: 'Путь к внешней обработке удаления fix-расширений')
+        string(name: 'CHECK_DB_EPF', defaultValue: '${WORKSPACE}\\tools\\MRS_ПроверкаБД.epf', description: 'Путь к внешней обработке проверки БД')
+        string(name: 'LAST_RELEASE_TASKS_FILE', defaultValue: 'D:\\DevOps\\deployment_state\\ERP\\last_release_tasks.txt', description: 'Файл со списком задач релиза')
+    }
+
     environment {
         STATE_DIR      = 'D:\\DevOps\\deployment_state\\ERP'
         CF_STATE_FILE  = "${STATE_DIR}\\${params.IB_NAME}_cf_tag.txt"
@@ -22,6 +28,8 @@ pipeline {
 
         // чисто информативно, для логов
         HAS_CHANGES    = 'false'
+        // Переменная для хранения текста ошибки из 1С
+        DB_HEALTH_CHECK_ERROR = ""
     }
 
     stages {
@@ -49,18 +57,10 @@ pipeline {
             steps {
                 script {
                     cleanWs()
-
-                    checkout([
-                        $class: 'GitSCM',
-                        branches: [[name: '*/master']],
-                        userRemoteConfigs: [[
-                            url: "https://${params.rep_git_remote}",
-                            credentialsId: 'token'
-                        ]],
-                        extensions: [
-                            [$class: 'CloneOption', shallow: true, noTags: true, timeout: 5, depth: 1]
-                        ]
-                    ])
+                    withCredentials([usernamePassword(credentialsId: 'token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+                        def remoteUrl = "https://${GIT_USER}:${GIT_TOKEN}@${env.rep_git_remote}"
+                        utils.cmd("git clone --branch master --single-branch ${remoteUrl} .", env.WORKSPACE)
+                    }
 
                     // служебные директории для хранения последних тегов
                     utils.ensureDirs(env.STATE_DIR, env.EXT_STATE_DIR)
@@ -235,6 +235,51 @@ pipeline {
         }
 
         // -----------------------------------------------------------------
+        // 3.5. Удаление Fix-расширений
+        // -----------------------------------------------------------------
+        stage('Delete Fix Extensions') {
+            steps {
+                script {
+                    if (!fileExists(params.LAST_RELEASE_TASKS_FILE)) {
+                        echo "Файл задач релиза не найден: ${params.LAST_RELEASE_TASKS_FILE}. Пропускаем удаление."
+                        return
+                    }
+
+                    def taskKeys = readFile(file: params.LAST_RELEASE_TASKS_FILE, encoding: 'UTF-8')
+                        .readLines()
+                        .collect { it.trim() }
+                        .findAll { it }
+
+                    if (taskKeys.isEmpty()) {
+                        echo "Файл задач пустой. Удаление fix-расширений пропускаем."
+                        return
+                    }
+
+                    if (!fileExists(params.FIX_DELETE_EPF)) {
+                        error "Не найдена внешняя обработка: ${params.FIX_DELETE_EPF}"
+                    }
+
+                    withCredentials([usernamePassword(
+                        credentialsId: params.SQL_PREPROD_CRED,
+                        usernameVariable: 'SQL_USER',
+                        passwordVariable: 'SQL_PASS'
+                    )]) {
+
+                        utils.deleteFixExtensions(
+                            params.FIX_DELETE_EPF,
+                            params.v8version,
+                            params.SERVER_1C_PREPROD,
+                            params.DB_PREPROD,
+                            SQL_USER,
+                            SQL_PASS,
+                            "ОбновлениеКонфигурации"
+                        )
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
         // 4. Обновление основной конфигурации (если изменился CF-тег)
         // -----------------------------------------------------------------
         stage('Update Main Configuration') {
@@ -356,6 +401,35 @@ pipeline {
         }
     }
 
+    // -----------------------------------------------------------------
+    // 5.5. Проверка работоспособности базы
+    // -----------------------------------------------------------------
+    stage('Check DB Health') {
+        steps {
+            script {
+                if (!fileExists(params.CHECK_DB_EPF)) {
+                    echo "⚠️ Обработка проверки БД не найдена: ${params.CHECK_DB_EPF}. Пропускаем."
+                } else {
+                    withCredentials([usernamePassword(
+                        credentialsId: params.SQL_PREPROD_CRED,
+                        usernameVariable: 'SQL_USER',
+                        passwordVariable: 'SQL_PASS'
+                    )]) {
+                        utils.checkDbHealth(
+                            params.CHECK_DB_EPF,
+                            params.v8version,
+                            params.SERVER_1C_PREPROD,
+                            params.DB_PREPROD,
+                            SQL_USER,
+                            SQL_PASS,
+                            "ОбновлениеКонфигурации"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     // ---------------------------------------------------------------------
     // 6. Post: всегда снимаем блокировку + уведомления
     // ---------------------------------------------------------------------
@@ -399,12 +473,16 @@ pipeline {
 
         failure {
             script {
-                utils.telegram_send_message(
-                    env.TELEGRAM_CHAT_TOKEN,
-                    env.TELEGRAM_CHAT_ID,
-                    "❌ Ошибка обновления PROD (${params.IB_NAME}) по тегам",
-                    false
-                )
+                def failMessage = "Ошибка обновления PROD"
+                if (fileExists("db_health_error.txt")) {
+                    def errMsg = readFile(file: "db_health_error.txt", encoding: "UTF-8").trim()
+                    if (errMsg) {
+                        failMessage += "\n\n⚠️ **Ошибка при проверке базы:**\n`" + errMsg + "`"
+                    }
+                } else if (env.DB_HEALTH_CHECK_ERROR) {
+                    failMessage += "\n\n⚠️ **Ошибка при проверке базы:**\n`" + env.DB_HEALTH_CHECK_ERROR + "`"
+                }
+                utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, failMessage, false)
             }
         }
     }

@@ -55,18 +55,18 @@ pipeline {
         stage('Collect release data') {
             steps {
                 script {
-                    def ws = pwd()
-                    def releaseDir = "${ws}/release_state".replace('\\','/')
-                    def stateFile  = "${releaseDir}/last_release_tag.txt"
+                    // Постоянный файл состояния, не в workspace
+                    def stateDir  = env.STATE_DIR.replace('\\','/')
+                    def stateFile = "${stateDir}/last_release_tag.txt"
                     env.RELEASE_STATE_FILE = stateFile
 
                     bat """
-                        if not exist "${releaseDir}" mkdir "${releaseDir}"
+                        if not exist "${env.STATE_DIR}" mkdir "${env.STATE_DIR}"
                     """
 
                     String lastTag = null
                     if (fileExists(stateFile)) {
-                        lastTag = readFile(stateFile).trim()
+                        lastTag = readFile(file: stateFile, encoding: 'UTF-8').trim()
                     }
                     echo "Последний релизный тег (из state): ${lastTag ?: '(нет, первый релиз)'}"
 
@@ -108,9 +108,7 @@ git describe --tags --abbrev=0
                     String rangeArg = lastTag ? "${lastTag}..${env.CURRENT_TAG}" : env.CURRENT_TAG
                     env.GIT_RANGE = rangeArg
 
-                    // 1) PS1 (ASCII only): формирует tasks_unique.txt
-                    //    - только строки вида "#PREFIX-1234 ..."
-                    //    - уникализация по ключу "#PREFIX-1234" (берём самое свежее из git log)
+                    // Формирует tasks_unique.txt
                     String ps1 = '''
 $ErrorActionPreference = 'Stop'
 
@@ -140,7 +138,6 @@ foreach ($l in $lines) {
     }
 }
 
-# write only task lines, UTF-8
 $out | Out-File -Encoding UTF8 tasks_unique.txt
 '''
                     writeFile(file: 'gen_tasks.ps1', text: ps1)
@@ -151,7 +148,6 @@ chcp 65001 > nul
 powershell -NoProfile -ExecutionPolicy Bypass -File gen_tasks.ps1
 '''
 
-                    // 2) Собираем release_notes.txt в Groovy (тут кириллица безопасна)
                     List<String> taskLines = []
                     if (fileExists('tasks_unique.txt')) {
                         taskLines = readFile('tasks_unique.txt')
@@ -171,7 +167,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File gen_tasks.ps1
                         }
                     }
 
-                    writeFile(file: 'release_notes.txt', text: notes)
+                    writeFile(file: 'release_notes.txt', text: notes, encoding: 'UTF-8')
 
                     echo readFile('release_notes.txt')
                 }
@@ -215,7 +211,7 @@ curl --request POST "${apiUrl}" ^
             when { expression { env.HAS_NEW_TAG == 'true' } }
             steps {
                 script {
-                    writeFile(file: env.RELEASE_STATE_FILE, text: env.CURRENT_TAG)
+                    writeFile(file: env.RELEASE_STATE_FILE, text: env.CURRENT_TAG, encoding: 'UTF-8')
                     echo "Тег ${env.CURRENT_TAG} записан в ${env.RELEASE_STATE_FILE}"
                 }
             }
