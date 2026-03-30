@@ -31,11 +31,12 @@ pipeline {
         
         FIX_DELETE_EPF = "${WORKSPACE}\\tools\\MRS_УдалениеИсправлений.epf"
         CHECK_DB_EPF = "${WORKSPACE}\\tools\\MRS_ПроверкаБД.epf"
+        CHECK_EXT_APPLICABILITY_EPF = "${WORKSPACE}\\tools\\MRS_ПроверкаПрименимостиРасширений.epf"
     }
 
     stages {
 
-         // -----------------------------------------------------------------
+        // -----------------------------------------------------------------
         // Уведомление в Telegram о начале обновления
         // -----------------------------------------------------------------
         stage('Notify Start') {
@@ -261,7 +262,7 @@ pipeline {
                     }
 
                     withCredentials([usernamePassword(
-                        credentialsId: params.SQL_PREPROD_CRED,
+                        credentialsId: params.SQL_CRED,
                         usernameVariable: 'SQL_USER',
                         passwordVariable: 'SQL_PASS'
                     )]) {
@@ -269,8 +270,8 @@ pipeline {
                         utils.deleteFixExtensions(
                             env.FIX_DELETE_EPF,
                             params.v8version,
-                            params.SERVER_1C_PREPROD,
-                            params.DB_PREPROD,
+                            params.SERVER_1C,
+                            params.DB_NAME,
                             SQL_USER,
                             SQL_PASS,
                             "ОбновлениеКонфигурации"
@@ -409,18 +410,18 @@ pipeline {
         steps {
             script {
                 if (!fileExists(env.CHECK_DB_EPF)) {
-                    echo "⚠️ Обработка проверки БД не найдена: ${params.CHECK_DB_EPF}. Пропускаем."
+                    echo "⚠️ Обработка проверки БД не найдена: ${env.CHECK_DB_EPF}. Пропускаем."
                 } else {
                     withCredentials([usernamePassword(
-                        credentialsId: params.SQL_PREPROD_CRED,
+                        credentialsId: params.SQL_CRED,
                         usernameVariable: 'SQL_USER',
                         passwordVariable: 'SQL_PASS'
                     )]) {
                         utils.checkDbHealth(
                             env.CHECK_DB_EPF,
                             params.v8version,
-                            params.SERVER_1C_PREPROD,
-                            params.DB_PREPROD,
+                            params.SERVER_1C,
+                            params.DB_NAME,
                             SQL_USER,
                             SQL_PASS,
                             "ОбновлениеКонфигурации"
@@ -430,6 +431,36 @@ pipeline {
             }
         }
     }
+
+        // -----------------------------------------------------------------
+        // 5.6. Проверка применимости расширений
+        // -----------------------------------------------------------------
+        stage('Check Extensions Applicability') {
+            steps {
+                script {
+                    if (!fileExists(env.CHECK_EXT_APPLICABILITY_EPF)) {
+                        echo "⚠️ Обработка проверки применимости расширений не найдена: ${env.CHECK_EXT_APPLICABILITY_EPF}. Пропускаем."
+                    } else {
+                        withCredentials([usernamePassword(
+                            credentialsId: params.SQL_CRED,
+                            usernameVariable: 'SQL_USER',
+                            passwordVariable: 'SQL_PASS'
+                        )]) {
+                            utils.checkExtensionsApplicability(
+                                env.CHECK_EXT_APPLICABILITY_EPF,
+                                params.v8version,
+                                params.SERVER_1C,
+                                params.DB_NAME,
+                                SQL_USER,
+                                SQL_PASS,
+                                "ОбновлениеКонфигурации"
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
 }
     // ---------------------------------------------------------------------
     // 6. Post: всегда снимаем блокировку + уведомления
@@ -475,14 +506,21 @@ pipeline {
         failure {
             script {
                 def failMessage = "Ошибка обновления PROD"
-                if (fileExists("db_health_error.txt")) {
-                    def errMsg = readFile(file: "db_health_error.txt", encoding: "UTF-8").trim()
-                    if (errMsg) {
-                        failMessage += "\n\n⚠️ **Ошибка при проверке базы:**\n`" + errMsg + "`"
-                    }
-                } else if (env.DB_HEALTH_CHECK_ERROR) {
-                    failMessage += "\n\n⚠️ **Ошибка при проверке базы:**\n`" + env.DB_HEALTH_CHECK_ERROR + "`"
+                
+                if (fileExists("extensions_applicability_error.txt")) {
+                def errMsg = readFile(file: "extensions_applicability_error.txt", encoding: "UTF-8").trim()
+                if (errMsg) {
+                    failMessage += "\n\n⚠️ **Ошибка применимости расширений:**\n`" + errMsg + "`"
                 }
+            } else if (fileExists("db_health_error.txt")) {
+                def errMsg = readFile(file: "db_health_error.txt", encoding: "UTF-8").trim()
+                if (errMsg) {
+                    failMessage += "\n\n⚠️ **Ошибка при проверке базы (1С):**\n`" + errMsg + "`"
+                }
+            } else if (env.DB_HEALTH_CHECK_ERROR) {
+                failMessage += "\n\n⚠️ **Ошибка при проверке базы (1С):**\n`" + env.DB_HEALTH_CHECK_ERROR + "`"
+            }
+
                 utils.telegram_send_message(env.TELEGRAM_CHAT_TOKEN, env.TELEGRAM_CHAT_ID, failMessage, false)
             }
         }

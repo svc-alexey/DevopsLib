@@ -44,6 +44,9 @@ pipeline {
         FIX_DELETE_EPF = "${WORKSPACE}\\tools\\MRS_УдалениеИсправлений.epf"
         CHECK_DB_EPF = "${WORKSPACE}\\tools\\MRS_ПроверкаБД.epf"
         CHECK_EXT_APPLICABILITY_EPF = "${WORKSPACE}\\tools\\MRS_ПроверкаПрименимостиРасширений.epf"
+        MANIFEST_FILE = "${WORKSPACE}\\extension-prod.json"
+        EXT_STATE_DIR = "D:\\DevOps\\deployment_state\\ERP\\extensions"
+        UPDATE_EXT_LIST = ""
     }
 
     stages {
@@ -85,6 +88,86 @@ pipeline {
 
                     echo "Сборка конфигурации..."
                     utils.compileCF_to_file_safe(env.SRC_CF_PATH, env.OUTPUT_CF_FILE)
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // 1.5. Проверка следующих тегов расширений
+        // -----------------------------------------------------------------
+        stage('Check Next Extension Tags') {
+            steps {
+                script {
+                    if (!fileExists(env.MANIFEST_FILE)) {
+                        echo "Файл manifest не найден: ${env.MANIFEST_FILE}. Обновление расширений пропускаем."
+                        env.UPDATE_EXT_LIST = ''
+                        return
+                    }
+
+                    def manifest = readJSON file: env.MANIFEST_FILE
+                    def extUpdates = [] as List<String>
+
+                    manifest.extensions.each { ext ->
+                        def name = ext.name
+                        def repo = ext.repo
+
+                        if (!name || !repo) {
+                            echo "Пропускаем некорректное описание расширения в manifest: ${ext}"
+                            return
+                        }
+
+                        def stateFile = "${env.EXT_STATE_DIR}\\${name}_tag.txt"
+                        def lastExtTag = fileExists(stateFile) ? readFile(stateFile).trim() : ''
+
+                        if (!lastExtTag) {
+                            echo "Для расширения '${name}' не найден state-файл '${stateFile}'. PRE-PROD не обновляет это расширение."
+                            return
+                        }
+
+                        def tagsRaw = ''
+                        withCredentials([usernamePassword(
+                            credentialsId: 'token',
+                            usernameVariable: 'GIT_USER',
+                            passwordVariable: 'GIT_TOKEN'
+                        )]) {
+                            tagsRaw = powershell(
+                                script: """
+                                    \$Token  = "${GIT_TOKEN}"
+                                    \$RepoUrl = "https://${GIT_USER}:\$Token@${repo.replace('https://','')}"
+                                    git ls-remote --tags --sort=v:refname \$RepoUrl |
+                                      Select-String -NotMatch "\\{\\}" |
+                                      ForEach-Object { (\$_ -split '\\s+')[1].Replace('refs/tags/', '') }
+                                """,
+                                returnStdout: true
+                            ).trim()
+                        }
+
+                        def tags = tagsRaw
+                            ? tagsRaw.readLines().collect { it.trim() }.findAll { it }
+                            : []
+
+                        if (tags.isEmpty()) {
+                            echo "Для расширения '${name}' не найдены git-теги."
+                            return
+                        }
+
+                        def currentIndex = tags.indexOf(lastExtTag)
+                        if (currentIndex < 0) {
+                            echo "Текущий PROD-тег '${lastExtTag}' для '${name}' не найден в репозитории. PRE-PROD обновление пропускаем."
+                            return
+                        }
+
+                        if (currentIndex + 1 < tags.size()) {
+                            def nextTag = tags[currentIndex + 1]
+                            echo "Для '${name}' найден следующий тег: ${nextTag} (текущий PROD-тег: ${lastExtTag})"
+                            extUpdates << "${name}:${nextTag}"
+                        } else {
+                            echo "Для '${name}' следующего тега после '${lastExtTag}' нет."
+                        }
+                    }
+
+                    env.UPDATE_EXT_LIST = extUpdates ? (extUpdates.join(';') + ';') : ''
+                    echo "Расширения для обновления в PRE-PROD: '${env.UPDATE_EXT_LIST}'"
                 }
             }
         }
@@ -229,6 +312,80 @@ pipeline {
             }
         }
 
+        // -----------------------------------------------------------------
+        // 4.1. Деплой расширений по следующим тегам
+        // -----------------------------------------------------------------
+        stage('Deploy Extensions by Tags') {
+            when {
+                expression {
+                    return ((env.UPDATE_EXT_LIST ?: '').trim() != '')
+                }
+            }
+            steps {
+                script {
+                    def manifest = readJSON file: env.MANIFEST_FILE
+                    def pairs = env.UPDATE_EXT_LIST.split(';').findAll { it }
+
+                    pairs.each { item ->
+                        def parts = item.split(':')
+                        def name  = parts[0]
+                        def tag   = parts[1]
+
+                        def ext = manifest.extensions.find { it.name == name }
+                        if (!ext) {
+                            error("В manifest не найдено описание расширения: ${name}")
+                        }
+
+                        def jobName = ext.job ?: "Build_CFE_${name}"
+                        def targetDir = "artifacts\\${name}"
+
+                        echo "Развёртывание расширения '${name}' по следующему тегу '${tag}' из job '${jobName}'"
+
+                        dir(targetDir) {
+                            deleteDir()
+                        }
+
+                        copyArtifacts(
+                            projectName: jobName,
+                            selector: lastSuccessful(),
+                            filter: "build/*${tag}*.cfe",
+                            target: targetDir,
+                            flatten: true
+                        )
+
+                        def cfeFiles = findFiles(glob: "${targetDir}/*.cfe")
+                        if (cfeFiles.length == 0) {
+                            error("Не найден .cfe с тегом '${tag}' в артефактах job '${jobName}'")
+                        }
+                        if (cfeFiles.length > 1) {
+                            def names = cfeFiles.collect { it.path }.join(', ')
+                            echo "Найдено несколько .cfe, беру первый: ${names}"
+                        }
+
+                        def cfeFile = cfeFiles[0].path
+                        echo "Найден файл расширения: ${cfeFile}. Загружаем в базу PRE-PROD."
+
+                        withCredentials([usernamePassword(
+                            credentialsId: params.SQL_PREPROD_CRED,
+                            usernameVariable: 'SQL_USER',
+                            passwordVariable: 'SQL_PASS'
+                        )]) {
+                            utils.updateExtension_via_ibcmd_or_vrunner(
+                                cfeFile,
+                                name,
+                                params.SERVER_1C_PREPROD,
+                                params.DB_PREPROD,
+                                SQL_USER,
+                                SQL_PASS
+                            )
+                        }
+
+                        echo "Тег state-файла для '${name}' НЕ обновляем, чтобы PROD потом обновился этим же тегом."
+                    }
+                }
+            }
+        }
+
     
         // -----------------------------------------------------------------
         // 4.5. Проверка работоспособности базы
@@ -266,7 +423,7 @@ pipeline {
         stage('Check Extensions Applicability') {
             steps {
                 script {
-                    if (!fileExists(params.CHECK_EXT_APPLICABILITY_EPF)) {
+                    if (!fileExists(env.CHECK_EXT_APPLICABILITY_EPF)) {
                         echo "⚠️ Обработка проверки применимости расширений не найдена: ${env.CHECK_EXT_APPLICABILITY_EPF}. Пропускаем."
                     } else {
                         withCredentials([usernamePassword(
@@ -275,7 +432,7 @@ pipeline {
                             passwordVariable: 'SQL_PASS'
                         )]) {
                             utils.checkExtensionsApplicability(
-                                params.CHECK_EXT_APPLICABILITY_EPF,
+                                env.CHECK_EXT_APPLICABILITY_EPF,
                                 params.v8version,
                                 params.SERVER_1C_PREPROD,
                                 params.DB_PREPROD,
