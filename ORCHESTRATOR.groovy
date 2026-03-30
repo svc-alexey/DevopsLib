@@ -14,8 +14,6 @@ pipeline {
     }
 
     parameters {
-        string(name: 'FIX_DELETE_EPF', defaultValue: '${WORKSPACE}\\tools\\MRS_УдалениеИсправлений.epf', description: 'Путь к внешней обработке удаления fix-расширений')
-        string(name: 'CHECK_DB_EPF', defaultValue: '${WORKSPACE}\\tools\\MRS_ПроверкаБД.epf', description: 'Путь к внешней обработке проверки БД')
         string(name: 'LAST_RELEASE_TASKS_FILE', defaultValue: 'D:\\DevOps\\deployment_state\\ERP\\last_release_tasks.txt', description: 'Файл со списком задач релиза')
     }
 
@@ -30,6 +28,9 @@ pipeline {
         HAS_CHANGES    = 'false'
         // Переменная для хранения текста ошибки из 1С
         DB_HEALTH_CHECK_ERROR = ""
+        
+        FIX_DELETE_EPF = "${WORKSPACE}\\tools\\MRS_УдалениеИсправлений.epf"
+        CHECK_DB_EPF = "${WORKSPACE}\\tools\\MRS_ПроверкаБД.epf"
     }
 
     stages {
@@ -255,7 +256,7 @@ pipeline {
                         return
                     }
 
-                    if (!fileExists(params.FIX_DELETE_EPF)) {
+                    if (!fileExists(env.FIX_DELETE_EPF)) {
                         error "Не найдена внешняя обработка: ${params.FIX_DELETE_EPF}"
                     }
 
@@ -266,7 +267,7 @@ pipeline {
                     )]) {
 
                         utils.deleteFixExtensions(
-                            params.FIX_DELETE_EPF,
+                            env.FIX_DELETE_EPF,
                             params.v8version,
                             params.SERVER_1C_PREPROD,
                             params.DB_PREPROD,
@@ -399,7 +400,7 @@ pipeline {
                 }
             }
         }
-    }
+
 
     // -----------------------------------------------------------------
     // 5.5. Проверка работоспособности базы
@@ -407,7 +408,7 @@ pipeline {
     stage('Check DB Health') {
         steps {
             script {
-                if (!fileExists(params.CHECK_DB_EPF)) {
+                if (!fileExists(env.CHECK_DB_EPF)) {
                     echo "⚠️ Обработка проверки БД не найдена: ${params.CHECK_DB_EPF}. Пропускаем."
                 } else {
                     withCredentials([usernamePassword(
@@ -416,7 +417,7 @@ pipeline {
                         passwordVariable: 'SQL_PASS'
                     )]) {
                         utils.checkDbHealth(
-                            params.CHECK_DB_EPF,
+                            env.CHECK_DB_EPF,
                             params.v8version,
                             params.SERVER_1C_PREPROD,
                             params.DB_PREPROD,
@@ -429,7 +430,7 @@ pipeline {
             }
         }
     }
-
+}
     // ---------------------------------------------------------------------
     // 6. Post: всегда снимаем блокировку + уведомления
     // ---------------------------------------------------------------------
