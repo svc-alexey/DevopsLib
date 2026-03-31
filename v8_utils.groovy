@@ -427,36 +427,40 @@ def telegram_send_message(TOKEN, CHAT_ID, messageText, success) {
     telegram_send_safe(TOKEN, CHAT_ID, messageText, true)
 }
 
-/** 
- * Безопасная отправка в Telegram 
+/**
+ * Безопасная отправка в MAX через curl
  * (НЕ валит pipeline при сетевых проблемах, использует ретраи)
  */
 def telegram_send_safe(String token, String chatId, String text, boolean disablePreview = true) {
     try {
         def ws = pwd()
-        def msgFile = "${ws}\\tmp_telegram_message.txt"
-        
-        // Пишем текст в файл, чтобы корректно передать переносы строк
-        writeFile file: msgFile, text: text, encoding: "UTF-8"
+        def msgFile = "${ws}\\tmp_max_message.json"
 
-        // returnStatus:true — не бросает exception, а возвращает код
+        def jsonText = groovy.json.JsonOutput.toJson([
+            text: text,
+            disable_link_preview: disablePreview,
+            notify: true
+        ])
+
+        writeFile file: msgFile, text: jsonText, encoding: "UTF-8"
+
         int rc = bat(
             returnStatus: true,
             script: """
-                chcp 65001 1>nul
+                chcp 65001 >nul
                 curl --http1.1 --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 10 --max-time 90 ^
-                  -X POST "https://api.telegram.org/bot${token}/sendMessage" ^
-                  -d chat_id="${chatId}" ^
-                  -d disable_web_page_preview=${disablePreview ? "true" : "false"} ^
-                  --data-urlencode text@"${msgFile}"
+                  -X POST "https://platform-api.max.ru/messages?chat_id=${chatId}" ^
+                  -H "Authorization: ${token}" ^
+                  -H "Content-Type: application/json; charset=utf-8" ^
+                  --data-binary "@${msgFile}"
             """.stripIndent()
         )
 
         if (rc != 0) {
-            echo "⚠️ Telegram notify failed (exit code ${rc}). Продолжаем выполнение пайплайна."
+            echo "⚠️ MAX notify failed (exit code ${rc}). Продолжаем выполнение пайплайна."
         }
     } catch (Throwable e) {
-        echo "⚠️ Telegram notify threw exception: ${e}. Продолжаем выполнение пайплайна."
+        echo "⚠️ MAX notify threw exception: ${e}. Продолжаем выполнение пайплайна."
     }
 }
 
@@ -967,6 +971,80 @@ def checkDbHealth(String epfPath, String v8version, String server1c, String dbNa
     
     echo "✅ Проверка базы успешно завершена."
     return rc
+}
+
+/**
+ * Проверка применимости всех расширений
+ */
+def checkExtensionsApplicability(String epfPath,
+                                 String v8version,
+                                 String server1c,
+                                 String dbName,
+                                 String dbUser,
+                                 String dbPass,
+                                 String uccode = "ОбновлениеКонфигурации") {
+    echo "=== Проверка применимости расширений: ${epfPath} ==="
+
+    def logFile = "check_extensions_applicability.log"
+
+    def rc = bat(
+        returnStatus: true,
+        script: """
+            @echo off
+            chcp 65001 >nul
+            setlocal enableextensions
+
+            vrunner run ^
+              --execute "${epfPath}" ^
+              --v8version "${v8version}" ^
+              --ibconnection "/S${server1c}\\${dbName}" ^
+              --db-user "${dbUser}" ^
+              --db-pwd "${dbPass}" ^
+              --uccode "${uccode}" ^
+              --command "/DisableStartupMessages /DisableStartupDialogs" > ${logFile} 2>&1
+
+            set VRUNNER_RC=%ERRORLEVEL%
+            type ${logFile}
+            exit /b %VRUNNER_RC%
+        """.stripIndent()
+    )
+
+    def logContent = ""
+    if (fileExists(logFile)) {
+        logContent = readFile(file: logFile, encoding: "UTF-8")
+    }
+
+    def servicePatterns = [
+        ~/^\s*vanessa-runner.*$/,
+        ~/^\s*ИНФОРМАЦИЯ\s*-\s*.*$/,
+        ~/^\s*$/
+    ]
+
+    def meaningfulLines = []
+    logContent.readLines().each { line ->
+        def trimmed = line?.trim() ?: ""
+        boolean isServiceLine = servicePatterns.any { p -> trimmed ==~ p }
+        if (!isServiceLine) {
+            meaningfulLines << trimmed
+        }
+    }
+
+    if (rc != 0 || !meaningfulLines.isEmpty()) {
+        if (!meaningfulLines.isEmpty()) {
+            writeFile(
+                file: "extensions_applicability_error.txt",
+                text: meaningfulLines.join(System.lineSeparator()),
+                encoding: "UTF-8"
+            )
+            echo "❌ Найдены ошибки применимости расширений:"
+            meaningfulLines.each { echo it }
+        }
+
+        error "Ошибка при проверке применимости расширений (код ${rc})"
+    }
+
+    echo "✅ Ошибок применимости расширений не обнаружено."
+    return 0
 }
 
 /**

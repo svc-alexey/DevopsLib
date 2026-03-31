@@ -491,14 +491,27 @@ pipeline {
                 )
 
                 if (hasAnyChanges) {
+                    // Технологический чат
                     utils.telegram_send_message(
                         env.TELEGRAM_CHAT_TOKEN,
                         env.TELEGRAM_CHAT_ID,
                         "✅ Обновление PROD (${params.IB_NAME}) по тегам завершено",
                         true
                     )
+
+                    // Пользовательский чат
+                    if ((env.MAX_USER_CHAT_ID ?: '').trim()) {
+                        utils.telegram_send_user_message(
+                            env.TELEGRAM_CHAT_TOKEN,
+                            env.MAX_USER_CHAT_ID,
+                            "Обновление (${params.IB_NAME}) успешно завершено!",
+                            true
+                        )
+                    } else {
+                        echo "MAX_USER_CHAT_ID не задан, пользовательское уведомление пропускаем."
+                    }
                 } else {
-                    echo "Обновлений не было, телеграм не трогаем."
+                    echo "Обновлений не было, уведомления не отправляем."
                 }
             }
         }
