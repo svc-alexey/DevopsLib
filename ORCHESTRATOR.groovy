@@ -15,6 +15,7 @@ pipeline {
 
     parameters {
         string(name: 'LAST_RELEASE_TASKS_FILE', defaultValue: 'D:\\DevOps\\deployment_state\\ERP\\last_release_tasks.txt', description: 'Файл со списком задач релиза')
+        string(name: 'DELETE_CFG_EXTENSION_NAME', defaultValue: '', description: 'Имя расширения для удаления через Конфигуратор (DESIGNER /DeleteCfg). Пусто — шаг не выполняется.')
     }
 
     environment {
@@ -275,6 +276,39 @@ pipeline {
                             SQL_USER,
                             SQL_PASS,
                             "ОбновлениеКонфигурации"
+                        )
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // 3.6. Удаление расширения через Конфигуратор (опционально, без остановки пайплайна)
+        // -----------------------------------------------------------------
+        stage('Delete extension via Designer (optional)') {
+            when {
+                expression {
+                    return (params.DELETE_CFG_EXTENSION_NAME ?: '').trim() != ''
+                }
+            }
+            steps {
+                script {
+                    def extName = params.DELETE_CFG_EXTENSION_NAME.trim()
+                    def logPath = "${env.WORKSPACE}\\delete_ext_designer.log"
+
+                    withCredentials([usernamePassword(
+                        credentialsId: params.SQL_CRED,
+                        usernameVariable: 'SQL_USER',
+                        passwordVariable: 'SQL_PASS'
+                    )]) {
+                        utils.deleteCfgExtensionViaDesignerResilient(
+                            params.v8version,
+                            params.SERVER_1C,
+                            params.DB_NAME,
+                            SQL_USER,
+                            SQL_PASS,
+                            extName,
+                            logPath
                         )
                     }
                 }

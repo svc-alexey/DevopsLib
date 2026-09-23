@@ -25,13 +25,13 @@ pipeline {
     }
 
     parameters {
-        string(name: 'SHARED_BACKUP_PATH', defaultValue: '\\\\opl-dc01-sqlc3\\backup_base\\BACKUP\\ERP\\SHARED', description: 'Сетевой путь для бэкапа, доступный обоим SQL серверам')
-        string(name: 'LAST_RELEASE_TASKS_FILE', defaultValue: 'D:\\DevOps\\deployment_state\\ERP\\last_release_tasks.txt', description: 'Файл со списком задач релиза')
+        string(name: 'SHARED_BACKUP_PATH', defaultValue: '\\\\opl-dc01-sqlc3\\backup_base\\BACKUP\\itilium\\SHARED', description: 'Сетевой путь для бэкапа, доступный обоим SQL серверам')
+        string(name: 'LAST_RELEASE_TASKS_FILE', defaultValue: 'D:\\DevOps\\deployment_state\\ITILIUM\\last_release_tasks.txt', description: 'Файл со списком задач релиза')
     }
 
     environment {
         // Формируем имя файла бэкапа один раз, чтобы использовать везде
-        BACKUP_FILENAME = "ERP_Prod_Transfer_${new Date().format('yyyyMMdd_HHmmss')}.bak"
+        BACKUP_FILENAME = "ITILIUM_Prod_Transfer_${new Date().format('yyyyMMdd_HHmmss')}.bak"
         FULL_BACKUP_PATH = "${params.SHARED_BACKUP_PATH}\\${BACKUP_FILENAME}"
 
         // Пути для сборки CF
@@ -45,7 +45,7 @@ pipeline {
         CHECK_DB_EPF = "${WORKSPACE}\\tools\\MRS_ПроверкаБД.epf"
         CHECK_EXT_APPLICABILITY_EPF = "${WORKSPACE}\\tools\\MRS_ПроверкаПрименимостиРасширений.epf"
         MANIFEST_FILE = "${WORKSPACE}\\extension-prod.json"
-        EXT_STATE_DIR = "D:\\DevOps\\deployment_state\\ERP\\extensions"
+        EXT_STATE_DIR = "D:\\DevOps\\deployment_state\\ITILIUM\\extensions"
         UPDATE_EXT_LIST = ""
     }
 

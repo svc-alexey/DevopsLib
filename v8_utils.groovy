@@ -65,8 +65,129 @@ def extractIssueKey(String message) {
 
 /** ------------------------ Синхронизация хранилища 1С (gitsync) ------------------------- */
 
+def executorId() {
+    def raw = env.EXECUTOR_NUMBER ?: '0'
+    def id = raw.replaceAll('[^0-9]', '')
+    return id ? id : '0'
+}
+
+def shortWorkspace() {
+    return env.SHORT_WS?.trim() ? env.SHORT_WS : env.WORKSPACE
+}
+
+/**
+ * Junction с коротким путём на workspace: конфигуратор 1С не умеет писать
+ * исходники ERP в длинный каталог Jenkins.
+ * Снимается через unmountShortWorkspace() — rmdir только по junction.
+ */
+def mountShortWorkspace(String workspace) {
+    if (!workspace?.trim()) error "Не задан каталог workspace для gitsync"
+    def drive = workspace.substring(0, 2)
+    if (!(drive ==~ /[A-Za-z]:/)) error "Ожидался путь с буквой диска, получен: ${workspace}"
+
+    def id = executorId()
+    def link = "${drive}\\t\\e${id}"
+    def temp = "${drive}\\t\\tmp${id}"
+    def rc = bat(script: """
+        @echo off
+        if not exist "${drive}\\t" mkdir "${drive}\\t"
+        if exist "${link}" rmdir "${link}"
+        if exist "${link}" (
+            echo Не удалось снять ${link} . Каталог занят или это не junction.
+            exit /b 1
+        )
+        if not exist "${temp}" mkdir "${temp}"
+        mklink /J "${link}" "${workspace}"
+        if errorlevel 1 exit /b 1
+        exit /b 0
+    """.stripIndent(), returnStatus: true)
+    if (rc != 0) error "Не удалось создать короткий путь ${link} -> ${workspace}"
+
+    env.SHORT_WS = link
+    env.GITSYNC_SHORT_TEMP = temp
+    echo "Короткий путь gitsync: ${link} -> ${workspace}. Временные файлы: ${temp}"
+    return link
+}
+
+def unmountShortWorkspace() {
+    def id = executorId()
+    def link = env.SHORT_WS
+    if (link?.trim()) {
+        def drive = link.length() >= 2 ? link.substring(0, 2) : ''
+        def expected = "${drive}\\t\\e${id}"
+        if (link == expected) {
+            // rmdir по junction снимает только связь, каталог репозитория не удаляется
+            bat(script: "if exist \"${link}\" rmdir \"${link}\"", returnStatus: true)
+        } else {
+            echo "Пропускаю снятие короткого пути, неожиданный каталог: ${link}"
+        }
+        env.SHORT_WS = ''
+    }
+
+    def temp = env.GITSYNC_SHORT_TEMP
+    if (temp?.trim()) {
+        def drive = temp.length() >= 2 ? temp.substring(0, 2) : ''
+        def expectedTemp = "${drive}\\t\\tmp${id}"
+        if (temp == expectedTemp) {
+            bat(script: "if exist \"${temp}\" rd /s /q \"${temp}\"", returnStatus: true)
+        } else {
+            echo "Пропускаю удаление временного каталога, неожиданный путь: ${temp}"
+        }
+        env.GITSYNC_SHORT_TEMP = ''
+    }
+}
+
+def gitsyncTempDir() {
+    if (env.GITSYNC_SHORT_TEMP?.trim()) return env.GITSYNC_SHORT_TEMP
+    def sample = env.SHORT_WS ?: env.WORKSPACE
+    if (!sample?.trim()) error "Не задан каталог для временных файлов gitsync"
+    def temp = "${sample.substring(0, 2)}\\t\\tmp${executorId()}"
+    bat(script: "if not exist \"${sample.substring(0, 2)}\\t\" mkdir \"${sample.substring(0, 2)}\\t\" & if not exist \"${temp}\" mkdir \"${temp}\"", returnStatus: true)
+    env.GITSYNC_SHORT_TEMP = temp
+    return temp
+}
+
+/**
+ * Пытается включить плагины increment и limit.
+ * Возвращает false, если после этого limit так и не появился в списке включённых.
+ * В части сборок gitsync этих плагинов нет: тогда sync выгружает все версии целиком.
+ */
+def ensureGitsyncPlugins() {
+    // call обязателен: gitsync.bat без call завершает весь командный файл на первой команде.
+    // Список читаем из вывода команды: запись в файл после chcp 65001 на этом агенте не создаёт файл.
+    bat(script: """
+        @echo off
+        call gitsync plugins init
+        call gitsync plugins enable increment
+        call gitsync plugins enable limit
+    """.stripIndent(), returnStatus: true)
+
+    def listed = bat(script: "@echo off\r\ncall gitsync plugins list -q", returnStdout: true)
+    def names = listed.readLines().collect { it.trim().toLowerCase() }
+    def hasLimit = names.contains('limit')
+    def hasIncrement = names.contains('increment')
+    env.GITSYNC_HAS_LIMIT = hasLimit ? 'true' : 'false'
+    env.GITSYNC_HAS_INCREMENT = hasIncrement ? 'true' : 'false'
+    echo "Включённые плагины:\n${listed}\nПлагин increment включён: ${env.GITSYNC_HAS_INCREMENT}. Плагин limit включён: ${env.GITSYNC_HAS_LIMIT}."
+    return hasLimit
+}
+
+def runGitsyncCommand(String command) {
+    def temp = gitsyncTempDir()
+    return bat(script: """
+        @echo off
+        chcp 65001 > nul
+        set "TEMP=${temp}"
+        set "TMP=${temp}"
+        set "GITSYNC_TEMP=${temp}"
+        set "GITSYNC_VERBOSE=true"
+        powershell -NoProfile -Command "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}"
+    """.stripIndent(), returnStatus: true)
+}
+
 /**
  * Синхронизирует хранилище 1С с Git-репозиторием через gitsync sync.
+ * Выгрузка инкрементальная: в каталог исходников пишутся только изменения версии.
  * @param rep_1c Путь к хранилищу 1С.
  * @param rep_git_local_src_cf Локальный путь к каталогу /src/cf в Git-репозитории.
  * @return Код возврата процесса gitsync.
@@ -74,7 +195,7 @@ def extractIssueKey(String message) {
 def sync_hran(rep_1c, rep_git_local_src_cf, rep_git_remote, ext = "", aditional_parameters, server1c, repo_user, repo_pass) {
     if (ext?.trim()) { ext = "--ext ${ext.trim()}" } else { ext = "" }
     def command = "gitsync sync --storage-user \"${repo_user}\" --storage-pwd \"${repo_pass}\" ${ext} ${aditional_parameters} \"${rep_1c}\" \"${rep_git_local_src_cf}\""
-    return bat(script: "powershell -Command \"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}\"", returnStatus: true)
+    return runGitsyncCommand(command)
 }
 
 /**
@@ -86,7 +207,7 @@ def sync_hran(rep_1c, rep_git_local_src_cf, rep_git_remote, ext = "", aditional_
 def init_hran(rep_1c, rep_git_local_src_cf, ext = "", server1c = "", repo_user, repo_pass) {
     if (ext?.trim()) { ext = "--ext ${ext.trim()}" } else { ext = "" }
     def command = "gitsync init --storage-user \"${repo_user}\" --storage-pwd \"${repo_pass}\" ${ext} \"${rep_1c}\" \"${rep_git_local_src_cf}\""
-    return bat(script: "powershell -Command \"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${command}\"", returnStatus: true)
+    return runGitsyncCommand(command)
 }
 
 
@@ -95,7 +216,7 @@ def init_hran(rep_1c, rep_git_local_src_cf, ext = "", server1c = "", repo_user, 
 /**
  * Сборка основной конфигурации (.cf) из исходников src\cf
  */
-def compileCF_to_file_safe(String srcDir, String outputCfFile, String v8version = '8.3.27.1859') {
+def compileCF_to_file_safe(String srcDir, String outputCfFile, String v8version = '8.3.27.2214') {
     ensureDirs(new File(outputCfFile).getParent())
     def cmdline = "vrunner compile --src \"${srcDir}\" --out \"${outputCfFile}\" --v8version \"${v8version}\""
     echo "Компиляция основной конфигурации в файл .cf..."
@@ -107,7 +228,7 @@ def compileCF_to_file_safe(String srcDir, String outputCfFile, String v8version 
 /**
  * Сборка расширения (.cfe) из исходников src\cfe
  */
-def compileCFE_to_file_safe(String extName, String srcDir, String outputCfeFile, String v8version = '8.3.27.1859') {
+def compileCFE_to_file_safe(String extName, String srcDir, String outputCfeFile, String v8version = '8.3.27.2214') {
     ensureDirs(new File(outputCfeFile).getParent())
     def cmdline = "vrunner compileexttocfe --src \"${srcDir}\" --out \"${outputCfeFile}\" --v8version \"${v8version}\""
     echo "Компиляция расширения '${extName}' в файл .cfe..."
@@ -128,7 +249,7 @@ def updateDB_via_ibcmd_or_vrunner(String cfFile,
                                   String dbName,
                                   String sqlUser,
                                   String sqlPass,
-                                  String v8version = '8.3.27.1859') {
+                                  String v8version = '8.3.27.2214') {
     if (!fileExists(cfFile)) {
         error "Файл конфигурации не найден: ${cfFile}"
     }
@@ -206,7 +327,7 @@ def updateDB_via_ibcmd_or_vrunner(String cfFile,
 def updateExtension_via_ibcmd_or_vrunner(String cfePath, String extName,
                                          String server, String dbName,
                                          String sqlUser, String sqlPass,
-                                         String v8version = '8.3.27.1859') {
+                                         String v8version = '8.3.27.2214') {
     if (!fileExists(cfePath)) error "Файл расширения не найден: ${cfePath}"
 
     echo "=== Обновление расширения '${extName}' в базе '${dbName}' ==="
@@ -264,7 +385,7 @@ def updateDB_preprod_vrunner_resilient_after_restore(String cfFile,
                                                      String dbName,
                                                      String sqlUser,
                                                      String sqlPass,
-                                                     String v8version = '8.3.27.1859',
+                                                     String v8version = '8.3.27.2214',
                                                      int attempts = 3,
                                                      int warmupWaitSec = 30) {
 
@@ -464,6 +585,14 @@ def telegram_send_safe(String token, String chatId, String text, boolean disable
     }
 }
 
+/**
+ * Простое уведомление для пользовательского чата без тех. деталей
+ */
+def telegram_send_user_message(String token, String chatId, String messageText, boolean success = true) {
+    def prefix = success ? "✅ " : "❌ "
+    def finalText = prefix + (messageText ?: "")
+    telegram_send_safe(token, chatId, finalText, true)
+}
 
 /** ---------------------- BACKUP --------------------- */
 
@@ -661,6 +790,83 @@ def isMergeCommit(String repoDir, String commit) {
  * Приоритет: состояние из хранилища 1С (ветка 1C_REPO / коммит), а не то,
  * что уже в feature-ветке.
  */
+/**
+ * В индексе и в переносимом коммите один путь может отличаться только регистром.
+ * На Windows cherry-pick тогда останавливается. Переименовывает такие пути
+ * к варианту из коммита и фиксирует это отдельным коммитом.
+ */
+def normalizeCaseForCommit(String repoDir, String commit) {
+    writeFile file: '.git/normalize-case.ps1', encoding: 'UTF-8', text: '''
+chcp 65001 > $null
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+Set-Location -LiteralPath $env:CASE_REPO
+$index = @{}
+git -c core.quotepath=false ls-files | ForEach-Object {
+    if ($_) { $index[$_.ToLowerInvariant()] = $_ }
+}
+$pairs = @()
+$diskMoves = @{}
+git -c core.quotepath=false diff-tree --no-commit-id --name-only -r $env:CASE_COMMIT | ForEach-Object {
+    $p = $_
+    if (-not $p) { return }
+    $key = $p.ToLowerInvariant()
+    if (-not $index.ContainsKey($key)) { return }
+    $oldFull = $index[$key]
+    if ($oldFull -ceq $p) { return }
+    $pairs += ,@($oldFull, $p)
+    $a = $oldFull -split '/'
+    $b = $p -split '/'
+    $accA = New-Object System.Collections.Generic.List[string]
+    $accB = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt [Math]::Min($a.Count, $b.Count); $i++) {
+        $accA.Add($a[$i])
+        $accB.Add($b[$i])
+        if ($a[$i] -cne $b[$i]) {
+            $diskMoves[($accA -join '/')] = ($accB -join '/')
+            break
+        }
+    }
+}
+if ($pairs.Count -eq 0) { exit 0 }
+$ordered = $diskMoves.GetEnumerator() | Sort-Object { ($_.Key -split '/').Count }
+foreach ($m in $ordered) {
+    $parentRel = ($m.Key -split '/') | Select-Object -SkipLast 1
+    $parent = if ($parentRel) { Join-Path (Get-Location) ($parentRel -join [char]92) } else { Get-Location }
+    $leafOld = ($m.Key -split '/')[-1]
+    $leafNew = ($m.Value -split '/')[-1]
+    $from = Join-Path $parent $leafOld
+    if (-not (Test-Path -LiteralPath $from)) { continue }
+    $tmp = Join-Path $parent ($leafOld + '.__case_tmp__')
+    $to = Join-Path $parent $leafNew
+    Move-Item -LiteralPath $from -Destination $tmp -Force
+    Move-Item -LiteralPath $tmp -Destination $to -Force
+    Write-Output "disk-rename $($m.Key) -> $($m.Value)"
+}
+foreach ($pair in $pairs) {
+    $old = $pair[0]
+    $new = $pair[1]
+    $line = git -c core.quotepath=false ls-files -s -- $old | Select-Object -First 1
+    if (-not $line) { Write-Output "skip missing $old"; continue }
+    $bits = $line.Split(@([char]32, [char]9), 4, [StringSplitOptions]::RemoveEmptyEntries)
+    git update-index --force-remove -- $old
+    if ($LASTEXITCODE -ne 0) { Write-Output "update-index remove failed: $old"; exit 1 }
+    git update-index --add --cacheinfo "$($bits[0]),$($bits[1]),$new"
+    if ($LASTEXITCODE -ne 0) { Write-Output "update-index add failed: $new"; exit 1 }
+    Write-Output "case-rename $old -> $new"
+}
+git diff --cached --quiet
+if ($LASTEXITCODE -eq 0) { exit 0 }
+git commit -m "normalize path case for cherry-pick"
+exit $LASTEXITCODE
+'''
+    withEnv(["CASE_REPO=${repoDir}", "CASE_COMMIT=${commit}"]) {
+        def rc = bat(script: "powershell -NoProfile -ExecutionPolicy Bypass -File \"${repoDir}\\.git\\normalize-case.ps1\"", returnStatus: true)
+        if (rc != 0) {
+            error "Не удалось нормализовать регистр путей перед cherry-pick ${commit} (код ${rc})"
+        }
+    }
+}
+
 def cherryPickTasksFrom1CRepo(String repoDir, String remoteHttps, String baseBranch = "1C_REPO", String compareBranch = "branch_sync_1c_repo") {
 
     echo "[cherryPickTasksFrom1CRepo] repoDir=${repoDir}, base=${baseBranch}, compare=${compareBranch}"
@@ -759,19 +965,24 @@ def cherryPickTasksFrom1CRepo(String repoDir, String remoteHttps, String baseBra
         def hasLocalFeature  = (git(repoDir, "show-ref --verify --quiet refs/heads/${featureBranch}") == 0)
         def hasRemoteFeature = (git(repoDir, "show-ref --verify --quiet refs/remotes/origin/${featureBranch}") == 0)
 
+        // -f нужен на Windows: в репозитории есть пути, отличающиеся только регистром,
+        // и обычный checkout останавливается на «untracked working tree files».
         if (!hasLocalFeature && !hasRemoteFeature) {
             echo "- Ветка ${featureBranch} не найдена ни локально, ни в origin. Создаю от ${compareBranch}"
-            git(repoDir, "checkout -B \"${featureBranch}\" \"${compareBranch}\"")
+            rc = git(repoDir, "checkout -f -B \"${featureBranch}\" \"${compareBranch}\"")
         } else if (!hasLocalFeature && hasRemoteFeature) {
             echo "- Локальной ветки нет, но есть origin/${featureBranch}. Чекаутим её"
-            git(repoDir, "checkout -B \"${featureBranch}\" \"origin/${featureBranch}\"")
+            rc = git(repoDir, "checkout -f -B \"${featureBranch}\" \"origin/${featureBranch}\"")
         } else if (hasLocalFeature && !hasRemoteFeature) {
             echo "- Ветка ${featureBranch} есть локально, а в origin нет. Использую локальную"
-            git(repoDir, "checkout \"${featureBranch}\"")
+            rc = git(repoDir, "checkout -f \"${featureBranch}\"")
         } else {
             echo "- Ветка ${featureBranch} есть и локально, и в origin. Синхронизирую с origin"
-            git(repoDir, "checkout \"${featureBranch}\"")
-            git(repoDir, "reset --hard \"origin/${featureBranch}\"")
+            rc = git(repoDir, "checkout -f \"${featureBranch}\"")
+            if (rc == 0) rc = git(repoDir, "reset --hard \"origin/${featureBranch}\"")
+        }
+        if (rc != 0) {
+            error "Не удалось перейти на ветку ${featureBranch} (код ${rc})"
         }
 
         def isMerge = isMergeCommit(repoDir, commit)
@@ -780,6 +991,13 @@ def cherryPickTasksFrom1CRepo(String repoDir, String remoteHttps, String baseBra
                 : "cherry-pick --keep-redundant-commits -X theirs ${commit}"
 
         rc = git(repoDir, cherryPickCmd)
+
+        if (rc != 0) {
+            echo "Cherry-pick коммита ${commit} в ${featureBranch} вернул код ${rc}. Снимаю конфликт регистра и повторяю."
+            git(repoDir, "cherry-pick --abort")
+            normalizeCaseForCommit(repoDir, commit)
+            rc = git(repoDir, cherryPickCmd)
+        }
 
         if (rc != 0) {
             echo "Cherry-pick коммита ${commit} в ${featureBranch} вернул код ${rc}. Пытаюсь авторазрулить конфликты."
@@ -859,12 +1077,12 @@ def updateBranchSyncFrom1CRepo(String repoDir, String remoteHttps, String baseBr
     def hasRemoteCompare = (git(repoDir, "show-ref --verify --quiet refs/remotes/origin/${compareBranch}") == 0)
 
     if (hasLocalCompare) {
-        git(repoDir, "checkout \"${compareBranch}\"")
+        git(repoDir, "checkout -f \"${compareBranch}\"")
     } else if (hasRemoteCompare) {
-        git(repoDir, "checkout -B \"${compareBranch}\" \"origin/${compareBranch}\"")
+        git(repoDir, "checkout -f -B \"${compareBranch}\" \"origin/${compareBranch}\"")
     } else {
         echo "Ветка ${compareBranch} не найдена ни локально, ни в origin. Создаю её от ${baseBranch}."
-        git(repoDir, "checkout -B \"${compareBranch}\" \"${baseBranch}\"")
+        git(repoDir, "checkout -f -B \"${compareBranch}\" \"${baseBranch}\"")
     }
 
     git(repoDir, "reset --hard")
@@ -916,6 +1134,76 @@ def deleteFixExtensions(String epfPath, String v8version, String server1c, Strin
     }
     
     echo "✅ Удаление fix-расширений завершено."
+    return rc
+}
+
+/**
+ * Удаление расширения через 1cv8 DESIGNER (/DeleteCfg -Extension).
+ * Не вызывает error(): при сбое только логирует предупреждение (пайплайн продолжается).
+ *
+ * @param logFile путь к файлу лога 1С (/Out), каталог создаётся при необходимости
+ * @return код возврата процесса 1cv8 или отрицательный при исключении
+ */
+def deleteCfgExtensionViaDesignerResilient(String v8version, String server1c, String dbName, String dbUser, String dbPass, String extensionName, String logFile) {
+    echo "=== Удаление расширения через Конфигуратор (устойчивый режим): ${extensionName} ==="
+
+    def exePath = "C:\\Program Files\\1cv8\\${v8version}\\bin\\1cv8.exe"
+    def ibConn = "${server1c}\\${dbName}"
+    def psQuote = { String s ->
+        if (!s) return ''
+        s.replace("'", "''").replace("\r", " ").replace("\n", " ")
+    }
+
+    def logParent = new File(logFile).getParent()
+    if (logParent?.trim()) {
+        ensureDirs(logParent)
+    }
+
+    def ps1 = """\$ErrorActionPreference = 'Continue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+\$exe = '${psQuote(exePath)}'
+\$ib = '${psQuote(ibConn)}'
+\$nu = '${psQuote(dbUser)}'
+\$np = '${psQuote(dbPass)}'
+\$ne = '${psQuote(extensionName)}'
+\$nl = '${psQuote(logFile)}'
+if (-not (Test-Path -LiteralPath \$exe)) {
+    Write-Host "Не найден 1cv8.exe: \$exe"
+    exit 2
+}
+\$argList = @('DESIGNER', '/S', \$ib, '/N', \$nu, '/P', \$np, '/DeleteCfg', '-Extension', \$ne, '/DisableStartupDialogs', '/Out', \$nl)
+\$p = Start-Process -FilePath \$exe -ArgumentList \$argList -Wait -PassThru -NoNewWindow
+Write-Host ("ExitCode=" + \$p.ExitCode)
+if (Test-Path -LiteralPath \$nl) {
+    Get-Content -LiteralPath \$nl -ErrorAction SilentlyContinue
+}
+exit \$p.ExitCode
+"""
+
+    int rc = -1
+    try {
+        writeFile encoding: 'UTF-8', file: 'delete_ext_designer_wrapper.ps1', text: ps1
+        rc = bat(
+            returnStatus: true,
+            script: """
+                @echo off
+                chcp 65001 >nul
+                powershell -NoProfile -ExecutionPolicy Bypass -File "delete_ext_designer_wrapper.ps1"
+                exit /b %ERRORLEVEL%
+            """.stripIndent()
+        )
+    } catch (Exception e) {
+        echo "⚠️ Исключение при удалении расширения через Конфигуратор: ${e.toString()}"
+        return -1
+    } finally {
+        bat(script: 'if exist delete_ext_designer_wrapper.ps1 del /f /q delete_ext_designer_wrapper.ps1', returnStatus: true)
+    }
+
+    if (rc != 0) {
+        echo "⚠️ Удаление расширения через Конфигуратор завершилось с кодом ${rc}. Пайплайн продолжается."
+    } else {
+        echo "✅ Вызов 1cv8 DESIGNER /DeleteCfg завершён (код 0)."
+    }
     return rc
 }
 

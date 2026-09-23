@@ -40,9 +40,24 @@ pipeline {
     options {
         timestamps() // Добавлять временные метки в лог
         disableConcurrentBuilds() // Запретить параллельный запуск этого пайплайна
+        timeout(time: 4, unit: 'HOURS') // Полная выгрузка длиннее инкремента
     }
 
     stages {
+        // До клонирования: без плагина limit выгрузка всех версий не уложится в таймаут.
+        stage('Check gitsync plugins') {
+            steps {
+                script {
+                    if (!utils.ensureGitsyncPlugins()) {
+                        error "В этом gitsync нет плагина limit. Выгрузка всех версий снова заняла бы несколько часов и оборвалась по таймауту. На агенте выполните: gitsync plugins list -a"
+                    }
+                    if (env.GITSYNC_HAS_INCREMENT != 'true') {
+                        echo "Плагина increment нет: версия выгрузится целиком, но за этот запуск берём только одну, чтобы она успела уйти в git."
+                    }
+                }
+            }
+        }
+
         // --- ЭТАП 1: Подготовка рабочего пространства ---
         stage('Checkout Source Code') {
             steps {
@@ -61,6 +76,14 @@ pipeline {
                     // Подтягиваем служебную ветку, необходимую для сравнения
                     utils.cmd("git fetch origin branch_sync_1c_repo:branch_sync_1c_repo", env.WORKSPACE)
                     utils.cmd("git checkout 1C_REPO", env.WORKSPACE)
+                    utils.cmd("git config core.longpaths true", env.WORKSPACE)
+                    // Секция user нужна gitsync, иначе commit падает с "no such section: bak.user"
+                    utils.cmd("git config user.name \"gitsync\"", env.WORKSPACE)
+                    utils.cmd("git config user.email \"gitsync@local\"", env.WORKSPACE)
+                    // Без этого файла плагин increment каждый запуск делает полную выгрузку.
+                    def gitignorePath = "${env.WORKSPACE}\\.gitignore"
+                    bat(script: "powershell -NoProfile -Command \"\$p='${gitignorePath}'; \$t = Get-Content -LiteralPath \$p | Where-Object { \$_.Trim() -ne 'ConfigDumpInfo.xml' }; Set-Content -LiteralPath \$p -Value \$t -Encoding ASCII\"", returnStatus: true)
+                    utils.mountShortWorkspace(env.WORKSPACE)
                 }
             }
         }
@@ -70,7 +93,7 @@ pipeline {
             steps {
                 script {
                     withCredentials([usernamePassword(credentialsId: 'repo_user_pass', usernameVariable: 'STORAGE_USER', passwordVariable: 'STORAGE_PASS')]) {
-                        def srcDir = "${env.WORKSPACE}\\src\\cf"
+                        def srcDir = "${utils.shortWorkspace()}\\src\\cf"
 
                         def rcInit = utils.init_hran(
                             params.STORAGE_PATH,
@@ -82,17 +105,19 @@ pipeline {
                         )
                         if (rcInit != 0) error "Ошибка инициализации хранилища: ${rcInit}"
 
-                        def rcSync = utils.sync_hran(
-                            params.STORAGE_PATH,
-                            srcDir,
-                            "https://${params.rep_git_remote}",
-                            params.EXTENSION_NAME,
-                            env.aditional_parameters ?: '',
-                            env.server1c,
-                            STORAGE_USER,
-                            STORAGE_PASS
-                        )
-                        if (rcSync != 0) error "Ошибка синхронизации: ${rcSync}"
+                        withEnv(['GITSYNC_LIMIT=1']) {
+                            def rcSync = utils.sync_hran(
+                                params.STORAGE_PATH,
+                                srcDir,
+                                "https://${params.rep_git_remote}",
+                                params.EXTENSION_NAME,
+                                env.aditional_parameters ?: '',
+                                env.server1c,
+                                STORAGE_USER,
+                                STORAGE_PASS
+                            )
+                            if (rcSync != 0) error "Ошибка синхронизации: ${rcSync}"
+                        }
                     }
 
                     // Windows-агентам иногда надо время "прийти в себя"
@@ -107,7 +132,7 @@ pipeline {
                 script {
                     // Отправляем все выгруженные коммиты в служебную ветку 1C_REPO
                     withCredentials([usernamePassword(credentialsId: 'token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
-                        utils.cmd("cd /D \"${env.WORKSPACE}\" & git push https://${GIT_USER}:${GIT_TOKEN}@${env.rep_git_remote} 1C_REPO")
+                        utils.cmd("git push https://${GIT_USER}:${GIT_TOKEN}@${env.rep_git_remote} 1C_REPO", utils.shortWorkspace())
                     }
                 }
             }
@@ -119,10 +144,10 @@ pipeline {
                 script {
                     // Устанавливаем URL с токеном для аутентификации
                     withCredentials([usernamePassword(credentialsId: 'token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
-                        utils.git(env.WORKSPACE, "remote set-url origin https://${GIT_USER}:${GIT_TOKEN}@${env.rep_git_remote}")
+                        utils.git(utils.shortWorkspace(), "remote set-url origin https://${GIT_USER}:${GIT_TOKEN}@${env.rep_git_remote}")
                     }
                     // Запускаем главный метод из библиотеки, который делает всю "магию"
-                    def rc = utils.cherryPickTasksFrom1CRepo(env.WORKSPACE, "https://${env.rep_git_remote}", "1C_REPO", "branch_sync_1c_repo")
+                    def rc = utils.cherryPickTasksFrom1CRepo(utils.shortWorkspace(), "https://${env.rep_git_remote}", "1C_REPO", "branch_sync_1c_repo")
                     if (rc != 0) error "Cherry-pick завершился с ошибкой: код ${rc}"
                 }
             }
@@ -133,7 +158,7 @@ pipeline {
             steps {
                 script {
                     // Обновляем ветку-маркер, чтобы в следующий раз не обрабатывать уже разнесенные коммиты
-                    def rc = utils.updateBranchSyncFrom1CRepo(env.WORKSPACE, "https://${env.rep_git_remote}", "1C_REPO", "branch_sync_1c_repo")
+                    def rc = utils.updateBranchSyncFrom1CRepo(utils.shortWorkspace(), "https://${env.rep_git_remote}", "1C_REPO", "branch_sync_1c_repo")
                     if (rc != 0) error "Синхронизация branch_sync_1c_repo завершилась с ошибкой: код ${rc}"
                 }
             }
@@ -142,6 +167,11 @@ pipeline {
     
     // --- Блок POST: Действия после завершения пайплайна ---
     post {
+        always {
+            script {
+                utils.unmountShortWorkspace()
+            }
+        }
         // Выполняется только при успешном завершении
         success {
             script {
