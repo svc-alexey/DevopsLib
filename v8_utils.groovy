@@ -991,33 +991,26 @@ def cherryPickTasksFrom1CRepo(String repoDir, String remoteHttps, String baseBra
                 : "cherry-pick --keep-redundant-commits -X theirs ${commit}"
 
         rc = git(repoDir, cherryPickCmd)
-
-        if (rc != 0) {
-            echo "Cherry-pick коммита ${commit} в ${featureBranch} вернул код ${rc}. Снимаю конфликт регистра и повторяю."
-            git(repoDir, "cherry-pick --abort")
-            normalizeCaseForCommit(repoDir, commit)
-            rc = git(repoDir, cherryPickCmd)
+        if (rc != 0 && git(repoDir, "rev-parse -q --verify CHERRY_PICK_HEAD") == 0) {
+            echo "Cherry-pick коммита ${commit} остановился на конфликте. Беру версию из этого коммита и продолжаю."
+            git(repoDir, "add -A")
+            rc = git(repoDir, "-c core.editor=true cherry-pick --continue")
         }
 
         if (rc != 0) {
-            echo "Cherry-pick коммита ${commit} в ${featureBranch} вернул код ${rc}. Пытаюсь авторазрулить конфликты."
-
-            git(repoDir, "diff --name-only --diff-filter=U > .git\\conflicts.txt")
-            def conflicts = readFile(file: "${repoDir}\\.git\\conflicts.txt", encoding: 'UTF-8').trim()
-            cmd("cd /D \"${repoDir}\" & del /Q .git\\conflicts.txt 2>nul")
-
-            if (conflicts) {
-                echo "Найдены конфликтующие файлы:\n${conflicts}"
-                // Берём вариант из целевой ветки (theirs) и доклеиваем
-                git(repoDir, "checkout --theirs .")
-                git(repoDir, "add .")
-                rc = git(repoDir, "cherry-pick --continue")
+            echo "Cherry-pick коммита ${commit} в ${featureBranch} вернул код ${rc}. Выравниваю регистр путей и повторяю."
+            git(repoDir, "cherry-pick --abort")
+            normalizeCaseForCommit(repoDir, commit)
+            rc = git(repoDir, cherryPickCmd)
+            if (rc != 0 && git(repoDir, "rev-parse -q --verify CHERRY_PICK_HEAD") == 0) {
+                git(repoDir, "add -A")
+                rc = git(repoDir, "-c core.editor=true cherry-pick --continue")
             }
+        }
 
-            if (rc != 0) {
-                git(repoDir, "cherry-pick --abort || git reset --hard")
-                error "Не удалось автоматически разрешить конфликт cherry-pick коммита ${commit} в ветке ${featureBranch}. Код ${rc}"
-            }
+        if (rc != 0) {
+            git(repoDir, "cherry-pick --abort")
+            error "Не удалось перенести коммит ${commit} в ветку ${featureBranch}. Код ${rc}"
         }
 
         rc = git(repoDir, "push origin \"${featureBranch}\"")
@@ -1028,7 +1021,8 @@ def cherryPickTasksFrom1CRepo(String repoDir, String remoteHttps, String baseBra
         updatedBranches << featureBranch
     }
 
-    git(repoDir, "checkout \"${baseBranch}\"")
+    git(repoDir, "-c core.ignorecase=false clean -fd")
+    git(repoDir, "checkout -f \"${baseBranch}\"")
 
     env.GITSYNC_NO_NEW_COMMITS   = "false"
     env.GITSYNC_UPDATED_BRANCHES = updatedBranches.join(' ')
@@ -1069,6 +1063,40 @@ def checkoutBranchAndFetchTags(String branchName, String remoteUrl, String works
  * Финальная синхронизация. Обновляет служебную ветку branch_sync_1c_repo,
  * чтобы отметить коммиты как обработанные и не обрабатывать их в следующий раз.
  */
+def removeCaseCollisionFiles(String repoDir, String otherRef) {
+    writeFile file: '.git/drop-case-files.ps1', encoding: 'UTF-8', text: '''
+chcp 65001 > $null
+$utf8 = New-Object System.Text.UTF8Encoding $false
+[Console]::InputEncoding = $utf8
+[Console]::OutputEncoding = $utf8
+$OutputEncoding = $utf8
+Set-Location -LiteralPath $env:CASE_REPO
+$index = @{}
+git -c core.quotepath=false ls-files | ForEach-Object {
+    if ($_) { $index[$_.ToLowerInvariant()] = $_ }
+}
+$removed = 0
+git -c core.quotepath=false ls-tree -r --name-only $env:CASE_OTHER | ForEach-Object {
+    $p = $_.Trim()
+    if (-not $p) { return }
+    $key = $p.ToLowerInvariant()
+    if (-not $index.ContainsKey($key)) { return }
+    if ($index[$key] -ceq $p) { return }
+    $full = Join-Path (Get-Location) ($p.Replace([char]47, [char]92))
+    if (Test-Path -LiteralPath $full) {
+        Remove-Item -LiteralPath $full -Force
+        $removed++
+        Write-Output "removed $p"
+    }
+}
+Write-Output "case-collisions-removed=$removed index=$($index.Count)"
+exit 0
+'''
+    withEnv(["CASE_REPO=${repoDir}", "CASE_OTHER=${otherRef}"]) {
+        bat(script: "powershell -NoProfile -ExecutionPolicy Bypass -File \"${repoDir}\\.git\\drop-case-files.ps1\"", returnStatus: true)
+    }
+}
+
 def updateBranchSyncFrom1CRepo(String repoDir, String remoteHttps, String baseBranch = "1C_REPO", String compareBranch = "branch_sync_1c_repo") {
     if (!repoDir?.trim()) error "updateBranchSync: repoDir is empty"
     git(repoDir, "fetch --all --prune")
@@ -1086,9 +1114,16 @@ def updateBranchSyncFrom1CRepo(String repoDir, String remoteHttps, String baseBr
     }
 
     git(repoDir, "reset --hard")
-    git(repoDir, "merge \"${baseBranch}\" --no-edit")
-    git(repoDir, "push origin \"${compareBranch}\"")
-    git(repoDir, "checkout \"${baseBranch}\"")
+    removeCaseCollisionFiles(repoDir, baseBranch)
+    def rcMerge = git(repoDir, "merge \"${baseBranch}\" --no-edit")
+    if (rcMerge != 0) {
+        error "Не удалось обновить ${compareBranch} из ${baseBranch} (код ${rcMerge}). Иначе те же коммиты разошлются повторно."
+    }
+    def rcPush = git(repoDir, "push origin \"${compareBranch}\"")
+    if (rcPush != 0) {
+        error "Не удалось отправить ${compareBranch} (код ${rcPush})"
+    }
+    git(repoDir, "checkout -f \"${baseBranch}\"")
     return 0
 }
 
