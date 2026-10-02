@@ -17,6 +17,90 @@ def cmd(String command, String workDir = "") {
     return bat(script: "chcp 65001 > nul\n${command}", returnStatus: true)
 }
 
+/**
+ * Запускает команду и ждёт не дольше timeoutMin минут.
+ * По таймауту дерево процесса убивается через taskkill /F /T, код возврата 124.
+ * Вывод дочернего процесса пишется в лог по мере появления.
+ */
+def runWithTimeout(String command, int timeoutMin) {
+    def timeoutMs = timeoutMin * 60 * 1000
+    def body = "@echo off\r\nchcp 65001 >nul\r\n${command}\r\nexit /b %ERRORLEVEL%\r\n"
+    def b64 = java.util.Base64.encoder.encodeToString(body.getBytes('UTF-8'))
+    def scriptFile = "tmp_run_timeout_${env.BUILD_NUMBER ?: '0'}_${System.currentTimeMillis()}.cmd"
+    def scriptPath = "${pwd()}\\${scriptFile}".replace("'", "''")
+    def rc = 1
+    try {
+        rc = powershell(
+            returnStatus: true,
+            script: """
+                \$ErrorActionPreference = 'Continue'
+                \$timeoutMs = ${timeoutMs}
+                \$bat = '${scriptPath}'
+                \$text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}'))
+                \$ansi = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage)
+                [IO.File]::WriteAllText(\$bat, \$text, \$ansi)
+
+                \$psi = New-Object System.Diagnostics.ProcessStartInfo
+                \$psi.FileName = 'cmd.exe'
+                \$psi.Arguments = '/d /s /c \"' + \$bat + '\"'
+                \$psi.UseShellExecute = \$false
+                \$psi.RedirectStandardOutput = \$true
+                \$psi.RedirectStandardError = \$true
+                \$psi.CreateNoWindow = \$true
+                \$utf8 = New-Object System.Text.UTF8Encoding \$false
+                \$psi.StandardOutputEncoding = \$utf8
+                \$psi.StandardErrorEncoding = \$utf8
+
+                \$p = New-Object System.Diagnostics.Process
+                \$p.StartInfo = \$psi
+
+                \$writeLine = {
+                    if (\$null -ne \$EventArgs.Data -and \$EventArgs.Data -ne '') {
+                        [Console]::Out.WriteLine(\$EventArgs.Data)
+                        [Console]::Out.Flush()
+                    }
+                }
+                Register-ObjectEvent -InputObject \$p -EventName OutputDataReceived -Action \$writeLine | Out-Null
+                Register-ObjectEvent -InputObject \$p -EventName ErrorDataReceived -Action \$writeLine | Out-Null
+
+                \$rc = 1
+                try {
+                    [void]\$p.Start()
+                    \$p.BeginOutputReadLine()
+                    \$p.BeginErrorReadLine()
+
+                    \$deadline = [DateTime]::UtcNow.AddMilliseconds(\$timeoutMs)
+                    \$timedOut = \$false
+                    while (-not \$p.HasExited) {
+                        if ([DateTime]::UtcNow -ge \$deadline) {
+                            \$timedOut = \$true
+                            Write-Output ("taskkill /F /T /PID " + \$p.Id)
+                            & taskkill.exe /F /T /PID \$p.Id 2>&1 | ForEach-Object { Write-Output \$_ }
+                            break
+                        }
+                        Start-Sleep -Milliseconds 200
+                    }
+
+                    if (-not \$p.HasExited) { [void]\$p.WaitForExit(15000) }
+                    Start-Sleep -Milliseconds 500
+                    if (\$timedOut) {
+                        \$rc = 124
+                    } elseif (\$null -ne \$p.ExitCode) {
+                        \$rc = \$p.ExitCode
+                    }
+                } finally {
+                    Get-EventSubscriber | Unregister-Event -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath \$bat -Force -ErrorAction SilentlyContinue
+                }
+                exit \$rc
+            """
+        )
+    } finally {
+        bat(script: "del /Q \"${scriptFile}\" 2>nul", returnStatus: true)
+    }
+    return rc
+}
+
 /** Проверка и создание директорий */
 def ensureDirs(String... dirs) {
     for (def d : dirs) {
@@ -725,6 +809,7 @@ def waitSqlReady(String serverSQL,
 /**
  * Захватывает эксклюзивную блокировку сеансов пользователей.
  * Использует rac-доступ к кластеру 1С.
+ * Отключение сеансов ограничено 30 минутами и одной повторной попыткой.
  */
 def lockSessions(String ras, String dbName, String racUser, String racPass, String reason = "Обновление конфигурации") {
     echo "🔒 Блокировка сеансов пользователей перед обновлением (${dbName})..."
@@ -737,17 +822,32 @@ def lockSessions(String ras, String dbName, String racUser, String racPass, Stri
     if (rcLock != 0) error "Не удалось заблокировать сеансы пользователей (код ${rcLock})"
     echo "✅ Сеансы пользователей заблокированы."
 
-    echo "🗡 Удаление активных сессий (${dbName})..."
-    def rcKill = cmd("""
+    int killTimeoutMin = 30
+    int killAttempts = 2
+    def killCmd = """
         vrunner session kill --ras ${ras} --db ${dbName} \
           --cluster-admin "${racUser}" --cluster-pwd "${racPass}" \
           --db-user "${racUser}" --db-pwd "${racPass}" \
           --uccode "ОбновлениеКонфигурации" --debuglog
-    """)
-    if (rcKill != 0) {
+    """
+    for (int attempt = 1; attempt <= killAttempts; attempt++) {
+        echo "🗡 Удаление активных сессий (${dbName}), попытка ${attempt}/${killAttempts}, таймаут ${killTimeoutMin} мин..."
+        def rcKill = runWithTimeout(killCmd, killTimeoutMin)
+        if (rcKill == 0) {
+            echo "✅ Активные сессии завершены."
+            break
+        }
+        if (rcKill == 124) {
+            echo "⏱ session kill не завершился за ${killTimeoutMin} мин (попытка ${attempt}/${killAttempts})."
+            if (attempt >= killAttempts) {
+                error "Не удалось завершить сеансы ${dbName}: session kill завис ${killAttempts} раза по ${killTimeoutMin} мин."
+            }
+            echo "Повторяем отключение сеансов..."
+            sleep time: 10, unit: 'SECONDS'
+            continue
+        }
         echo "⚠ Не удалось корректно завершить все сессии (код ${rcKill}). Продолжаем, так как блокировка активна."
-    } else {
-        echo "✅ Активные сессии завершены."
+        break
     }
 }
 
